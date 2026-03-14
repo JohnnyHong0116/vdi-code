@@ -11,6 +11,7 @@ from ament_index_python.packages import get_package_share_directory
 
 def generate_launch_description():
     start_mmdi = LaunchConfiguration("start_mmdi")
+    use_urscript_freedrive = LaunchConfiguration("use_urscript_freedrive")
 
     mmdi_launch = PythonLaunchDescriptionSource(
         [
@@ -24,6 +25,11 @@ def generate_launch_description():
             "start_mmdi",
             default_value="true",
             description="Launch the MMDI stack in addition to the UR control nodes.",
+        ),
+        DeclareLaunchArgument(
+            "use_urscript_freedrive",
+            default_value="true",
+            description="Use URScript-based freedrive controller (experimental).",
         ),
         Node(
             package="ur_control",
@@ -42,6 +48,13 @@ def generate_launch_description():
             executable="compliance_controller",
             name="compliance_controller",
             output="screen",
+        ),
+        Node(
+            package="ur_control",
+            executable="freedrive_controller",
+            name="freedrive_controller",
+            output="screen",
+            condition=IfCondition(use_urscript_freedrive),
         ),
         IncludeLaunchDescription(
             mmdi_launch,

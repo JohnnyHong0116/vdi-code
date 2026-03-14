@@ -19,7 +19,7 @@ from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
 
 from geometry_msgs.msg import PoseStamped, WrenchStamped
-from std_msgs.msg import Bool
+from std_msgs.msg import Bool, Int32
 from scipy.spatial.transform import Rotation as R
 import tf2_ros
 
@@ -33,6 +33,7 @@ class ComplianceController(Node):
         self.declare_parameter('tool_frame', 'tool0')
         self.declare_parameter('target_pose_topic', '/ur7e/target_pose')
         self.declare_parameter('teleop_active_topic', '/ur7e/teleop_active')
+        self.declare_parameter('mode_topic', '/mode')
         self.declare_parameter('desired_pose_topic', '/ur7e/desired_pose')
         self.declare_parameter('wrench_topic', '/force_torque_sensor_broadcaster/wrench')
 
@@ -56,12 +57,14 @@ class ComplianceController(Node):
         # Ignore target updates while engaged; apply the latest pending target after disengage
         self.declare_parameter('ignore_target_updates_while_engaged', True)
         self.declare_parameter('force_filter_alpha', 0.015)      # low-pass on wrench
+        self.declare_parameter('disable_compliance_in_mode2', True)
 
         # Resolve parameters
         self.base_frame = self.get_parameter('base_frame').value
         self.tool_frame = self.get_parameter('tool_frame').value
         self.target_topic = self.get_parameter('target_pose_topic').value
         self.teleop_active_topic = self.get_parameter('teleop_active_topic').value
+        self.mode_topic = self.get_parameter('mode_topic').value
         self.output_topic = self.get_parameter('desired_pose_topic').value
         self.wrench_topic = self.get_parameter('wrench_topic').value
 
@@ -83,6 +86,9 @@ class ComplianceController(Node):
         self.freeze_on_contact = bool(self.get_parameter('freeze_target_on_contact').value)
         self.ignore_updates_engaged = bool(self.get_parameter('ignore_target_updates_while_engaged').value)
         self.f_alpha = float(self.get_parameter('force_filter_alpha').value)
+        self.disable_compliance_in_mode2 = bool(
+            self.get_parameter('disable_compliance_in_mode2').value
+        )
 
         # State
         self.desired_pos = None
@@ -91,6 +97,7 @@ class ComplianceController(Node):
         self.anchor_q = None
         self.engaged = False
         self.teleop_active = False
+        self.mode = -1
 
         self.forces = np.zeros(3, dtype=float)
         self.torques = np.zeros(3, dtype=float)
@@ -121,6 +128,7 @@ class ComplianceController(Node):
         # Subs/Pubs
         self.create_subscription(PoseStamped, self.target_topic, self.on_target_pose, 1)
         self.create_subscription(Bool, self.teleop_active_topic, self.on_teleop_active, 1)
+        self.create_subscription(Int32, self.mode_topic, self.on_mode, 10)
         self.create_subscription(WrenchStamped, self.wrench_topic, self.on_wrench, qos_sensor)
         self.compliant_pub = self.create_publisher(PoseStamped, self.output_topic, 1)
 
@@ -130,8 +138,9 @@ class ComplianceController(Node):
         self.get_logger().info(f"Stiffness: Lin={self.K_lin} Ang={self.K_ang}")
         self.get_logger().info(f"Chain: {self.target_topic} -> [compliance] -> {self.output_topic}")
         self.get_logger().info(f"Teleop active topic: {self.teleop_active_topic}")
+        self.get_logger().info(f"Mode topic: {self.mode_topic}")
         self.get_logger().info(f"Wrench: {self.wrench_topic} (tool_frame={self.tool_frame})")
-        self.get_logger().info("Compliance always active with teleop inputs (override removed).")
+        self.get_logger().info(f"Disable compliance in mode 2: {self.disable_compliance_in_mode2}")
 
     # ------------------------------------------------------------------ #
     # Callbacks
@@ -162,6 +171,9 @@ class ComplianceController(Node):
 
     def on_teleop_active(self, msg: Bool):
         self.teleop_active = bool(msg.data)
+
+    def on_mode(self, msg: Int32):
+        self.mode = int(msg.data)
 
     def on_wrench(self, msg: WrenchStamped):
         raw_f = np.array([
@@ -240,6 +252,16 @@ class ComplianceController(Node):
 
         # If we are still taring, pass through the target pose
         if self.tare_samples > 0 and not self.is_tared:
+            self.publish_pose(self.desired_pos, self.desired_q)
+            return
+
+        if self.disable_compliance_in_mode2 and self.mode == 2:
+            # Give freedrive exclusive control in kinesthetic mode.
+            self.engaged = False
+            self.anchor_pos = None
+            self.anchor_q = None
+            self.pending_pos = None
+            self.pending_q = None
             self.publish_pose(self.desired_pos, self.desired_q)
             return
 

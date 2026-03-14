@@ -5,7 +5,7 @@ from rclpy.node import Node
 
 import tf2_ros
 from geometry_msgs.msg import PoseStamped
-from std_msgs.msg import String
+from std_msgs.msg import String, Int32
 from scipy.spatial.transform import Rotation as R
 
 
@@ -18,6 +18,7 @@ class PositionController(Node):
         self.declare_parameter('tool_frame', 'tool0')
         self.declare_parameter('desired_pose_topic', '/ur7e/desired_pose')
         self.declare_parameter('script_topic', '/urscript_interface/script_command')
+        self.declare_parameter('mode_topic', '/mode')
 
         self.declare_parameter('rate_hz', 450.0)
         self.declare_parameter('lin_P', 2.0)
@@ -29,6 +30,7 @@ class PositionController(Node):
         self.tool_frame = self.get_parameter('tool_frame').value
         self.desired_pose_topic = self.get_parameter('desired_pose_topic').value
         self.script_topic = self.get_parameter('script_topic').value
+        self.mode_topic = self.get_parameter('mode_topic').value
 
         self.rate_hz = float(self.get_parameter('rate_hz').value)
         self.lin_P = float(self.get_parameter('lin_P').value)
@@ -43,25 +45,29 @@ class PositionController(Node):
         # comms
         self.urscript_pub = self.create_publisher(String, self.script_topic, 1)
         self.des_sub = self.create_subscription(PoseStamped, self.desired_pose_topic, self.on_desired_pose, 1)
+        self.mode_sub = self.create_subscription(Int32, self.mode_topic, self.on_mode, 10)
 
         self.des_p = None
         self.des_q = None
+        self.mode = -1
+        self.was_mode_2 = False
 
         self.timer = self.create_timer(1.0 / self.rate_hz, self.tick)
 
         self.get_logger().info(f"position_controller listening: {self.desired_pose_topic}")
         self.get_logger().info(f"position_controller publishing URScript: {self.script_topic}")
         self.get_logger().info(f"TF: {self.base_frame} -> {self.tool_frame}")
+        self.get_logger().info(f"Mode topic: {self.mode_topic}")
 
     def on_desired_pose(self, msg: PoseStamped):
         self.des_p = np.array([msg.pose.position.x, msg.pose.position.y, msg.pose.position.z], dtype=float)
         self.des_q = np.array([msg.pose.orientation.x, msg.pose.orientation.y,
                                msg.pose.orientation.z, msg.pose.orientation.w], dtype=float)
 
-    def tick(self):
-        if self.des_p is None or self.des_q is None:
-            return
+    def on_mode(self, msg: Int32):
+        self.mode = int(msg.data)
 
+    def tick(self):
         # Get current EE pose from TF
         try:
             trans = self.tf_buffer.lookup_transform(self.base_frame, self.tool_frame, rclpy.time.Time())
@@ -80,6 +86,19 @@ class PositionController(Node):
             trans.transform.rotation.z,
             trans.transform.rotation.w
         ], dtype=float)
+
+        # Give freedrive exclusive control in kinesthetic mode.
+        if self.mode == 2:
+            self.des_p = curr_p.copy()
+            self.des_q = curr_q.copy()
+            if not self.was_mode_2:
+                self.urscript_pub.publish(String(data="speedl([0,0,0,0,0,0], 0.5, t=0.02)\n"))
+            self.was_mode_2 = True
+            return
+        self.was_mode_2 = False
+
+        if self.des_p is None or self.des_q is None:
+            return
 
         # Linear velocity (P)
         dp = self.des_p - curr_p

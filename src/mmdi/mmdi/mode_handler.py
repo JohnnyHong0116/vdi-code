@@ -41,6 +41,7 @@ class ModeHandler(Node):
         self.declare_parameter('tool_contact_debounce_s', 0.5)
         self.declare_parameter('external_force_default', 0.0)
         self.declare_parameter('wrench_tare_samples', 50)
+        self.declare_parameter('enable_freedrive_controller_topic', False)
         self.spacemouse_input_topic = self.get_parameter('spacemouse_input_topic').value
         self.external_force_topic = self.get_parameter('external_force_topic').value
         self.wrench_topic = self.get_parameter('wrench_topic').value
@@ -75,6 +76,9 @@ class ModeHandler(Node):
         self.wrench_tare_samples = max(
             0, int(self.get_parameter('wrench_tare_samples').value)
         )
+        self.enable_freedrive_controller_topic = bool(
+            self.get_parameter('enable_freedrive_controller_topic').value
+        )
 
         # Initial state
         self.tool_contact = 1
@@ -90,6 +94,7 @@ class ModeHandler(Node):
         self.wrench_tare_count = 0
         self.wrench_is_tared = (self.wrench_tare_samples == 0)
         self.kinesthetic_request_start = None
+        self.kinesthetic_entry_armed_after_hold = False
 
         # Publishers
         self.led_pub = self.create_publisher(String, '/led_state', 10)
@@ -138,6 +143,10 @@ class ModeHandler(Node):
             )
         self.get_logger().info(
             f'Kinesthetic force hold before mode 2: {self.kinesthetic_request_hold_s:.2f}s'
+        )
+        self.get_logger().info(
+            f'Publish /freedrive_mode_controller/enable_freedrive_mode: '
+            f'{self.enable_freedrive_controller_topic}'
         )
 
         # Defer start so TF and other nodes can initialize
@@ -235,6 +244,7 @@ class ModeHandler(Node):
             new_mode = self.target_mode
             self.target_mode = None  # Clear after using
             manual_override = True
+            self.kinesthetic_entry_armed_after_hold = False
 
         discrepancy = self.force_discrepancy()
         directional_discrepancy = self.kinesthetic_trigger_direction * discrepancy
@@ -261,6 +271,7 @@ class ModeHandler(Node):
             if self.mode == -1:
                 new_mode = 4 if detached else 1
             elif detached:
+                self.kinesthetic_entry_armed_after_hold = False
                 new_mode = 3 if self.odom_seen else 4
                 if self.mode not in (3, 4):
                     self.start_mode_four = time.time()
@@ -273,11 +284,20 @@ class ModeHandler(Node):
                     # Keep freedrive latched until SpaceMouse activity requests teleop.
                     new_mode = 1 if self.curr_sm else 2
                 elif self.curr_sm:
+                    self.kinesthetic_entry_armed_after_hold = False
                     new_mode = 1
+                elif self.kinesthetic_entry_armed_after_hold:
+                    # Enter freedrive only after force is released to avoid entering under push.
+                    if kinesthetic_released:
+                        new_mode = 2
+                        self.kinesthetic_armed = False
+                        self.kinesthetic_entry_armed_after_hold = False
+                    else:
+                        new_mode = 1
                 elif kinesthetic_requested_held and self.kinesthetic_armed:
-                    new_mode = 2
-                    self.kinesthetic_armed = False
-                    self.kinesthetic_request_start = None
+                    # Arm entry after force-hold; actual switch happens on release.
+                    self.kinesthetic_entry_armed_after_hold = True
+                    new_mode = 1
                 else:
                     new_mode = 1
 
@@ -289,7 +309,8 @@ class ModeHandler(Node):
         else:
             self.led_pub.publish(String(data=self.mode_colors[self.mode]))
 
-        self.freedrive_pub.publish(Bool(data=(self.mode == 2)))
+        if self.enable_freedrive_controller_topic:
+            self.freedrive_pub.publish(Bool(data=(self.mode == 2)))
 
         # Always publish current mode
         mode_msg = Int32()

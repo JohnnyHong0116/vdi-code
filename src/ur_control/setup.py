@@ -33,6 +33,7 @@ setup(
         'position_controller = ur_control.position_controller:main',
         'sm_teleop = ur_control.sm_teleop:main',
         'compliance_controller = ur_control.compliance_controller:main',
+        'freedrive_controller = ur_control.freedrive_controller:main',
         'viser_viewer = ur_control.viser_viewer:main',
     ],
 },
