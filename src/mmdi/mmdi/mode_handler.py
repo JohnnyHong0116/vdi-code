@@ -37,6 +37,7 @@ class ModeHandler(Node):
         self.declare_parameter('kinesthetic_trigger_direction', -1.0)
         self.declare_parameter('force_discrepancy_threshold_z', 4.0)
         self.declare_parameter('force_discrepancy_release_threshold_z', 2.0)
+        self.declare_parameter('kinesthetic_request_hold_s', 2.0)
         self.declare_parameter('tool_contact_debounce_s', 0.5)
         self.declare_parameter('external_force_default', 0.0)
         self.declare_parameter('wrench_tare_samples', 50)
@@ -62,6 +63,9 @@ class ModeHandler(Node):
         self.force_discrepancy_release_threshold_z = float(
             self.get_parameter('force_discrepancy_release_threshold_z').value
         )
+        self.kinesthetic_request_hold_s = float(
+            self.get_parameter('kinesthetic_request_hold_s').value
+        )
         self.tool_contact_debounce_s = float(
             self.get_parameter('tool_contact_debounce_s').value
         )
@@ -85,6 +89,7 @@ class ModeHandler(Node):
         self.wrench_tare_accum_z = 0.0
         self.wrench_tare_count = 0
         self.wrench_is_tared = (self.wrench_tare_samples == 0)
+        self.kinesthetic_request_start = None
 
         # Publishers
         self.led_pub = self.create_publisher(String, '/led_state', 10)
@@ -131,6 +136,9 @@ class ModeHandler(Node):
             self.get_logger().info(
                 f'Taring wrench Z with first {self.wrench_tare_samples} samples'
             )
+        self.get_logger().info(
+            f'Kinesthetic force hold before mode 2: {self.kinesthetic_request_hold_s:.2f}s'
+        )
 
         # Defer start so TF and other nodes can initialize
         self._init_timer = self.create_timer(2.0, self._start_processing)
@@ -235,6 +243,15 @@ class ModeHandler(Node):
         if not self.wrench_is_tared:
             kinesthetic_requested = False
             kinesthetic_released = True
+        if kinesthetic_requested:
+            if self.kinesthetic_request_start is None:
+                self.kinesthetic_request_start = time.time()
+            kinesthetic_requested_held = (
+                time.time() - self.kinesthetic_request_start
+            ) >= self.kinesthetic_request_hold_s
+        else:
+            self.kinesthetic_request_start = None
+            kinesthetic_requested_held = False
         detached = self.detached_stably()
 
         if kinesthetic_released:
@@ -253,16 +270,14 @@ class ModeHandler(Node):
                 if self.mode in (3, 4):
                     new_mode = 1
                 elif self.mode == 2:
-                    # Freedrive should only stay active while force is still applied.
-                    if self.curr_sm or kinesthetic_released:
-                        new_mode = 1
-                    else:
-                        new_mode = 2
+                    # Keep freedrive latched until SpaceMouse activity requests teleop.
+                    new_mode = 1 if self.curr_sm else 2
                 elif self.curr_sm:
                     new_mode = 1
-                elif kinesthetic_requested and self.kinesthetic_armed:
+                elif kinesthetic_requested_held and self.kinesthetic_armed:
                     new_mode = 2
                     self.kinesthetic_armed = False
+                    self.kinesthetic_request_start = None
                 else:
                     new_mode = 1
 
