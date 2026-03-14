@@ -22,6 +22,7 @@ setup(
     tests_require=['pytest'],
     entry_points={
         'console_scripts': [
+            'arduino_handler = mmdi.arduino_handler:main',
             'mode_handler = mmdi.mode_handler:main',
             'natural_handler = mmdi.natural_handler:main',
             'probe_tracker = mmdi.probe_tracker:main',

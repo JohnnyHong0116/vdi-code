@@ -2,7 +2,9 @@
 
 """Particle filter and rotation utilities for probe tip tracking.
 
-Ported from the standalone probe tracker script.
+The tracker needs to stay smooth without adding noticeable lag, so the filter
+uses a constant-velocity state and adaptive temporal blending rather than a
+position-only random walk.
 """
 
 import numpy as np
@@ -13,8 +15,8 @@ from scipy.spatial.transform import Rotation as SciRot
 # Rotation helpers
 # ---------------------------------------------------------------------------
 
-def average_rotations(rotations):
-    """Weighted average of 3x3 rotation matrices (Markley quaternion method).
+def average_rotations(rotations, weights=None):
+    """Weighted average of 3x3 rotation matrices via SVD projection.
 
     Parameters
     ----------
@@ -28,17 +30,20 @@ def average_rotations(rotations):
         return None
     if len(rotations) == 1:
         return rotations[0]
-    quats = np.array([SciRot.from_matrix(r).as_quat() for r in rotations])  # xyzw
-    n = quats.shape[0]
-    w = 1.0 / n
-    M = np.zeros((4, 4))
-    for q in quats:
-        M += w * np.outer(q, q)
-    vals, vecs = np.linalg.eigh(M)
-    avg_q = vecs[:, -1]
-    if avg_q[3] < 0:
-        avg_q = -avg_q
-    return SciRot.from_quat(avg_q / np.linalg.norm(avg_q)).as_matrix()
+    if weights is None:
+        weights = np.ones(len(rotations), dtype=np.float64)
+    weights = np.asarray(weights, dtype=np.float64)
+    weights = np.clip(weights, 1e-9, None)
+    weights /= weights.sum()
+    M = np.zeros((3, 3), dtype=np.float64)
+    for R_mat, w in zip(rotations, weights):
+        M += w * np.asarray(R_mat, dtype=np.float64)
+    U, _, Vt = np.linalg.svd(M)
+    R_mean = U @ Vt
+    if np.linalg.det(R_mean) < 0:
+        U[:, -1] *= -1.0
+        R_mean = U @ Vt
+    return R_mean
 
 
 def get_angular_distance(R1, R2):
@@ -47,6 +52,35 @@ def get_angular_distance(R1, R2):
     trace = np.clip(np.trace(R_diff), -1.0, 3.0)
     angle_rad = np.arccos(np.clip((trace - 1.0) / 2.0, -1.0, 1.0))
     return np.degrees(angle_rad)
+
+
+def adaptive_blend_alpha(delta, min_alpha, max_alpha, response_scale):
+    """Blend small jitter heavily and large motion lightly."""
+    if response_scale <= 1e-9:
+        return float(max_alpha)
+    ramp = np.clip(float(delta) / float(response_scale), 0.0, 1.0)
+    return float(min_alpha + (max_alpha - min_alpha) * ramp)
+
+
+def blend_positions(prev_pos, next_pos, alpha):
+    if prev_pos is None:
+        return np.asarray(next_pos, dtype=np.float64)
+    alpha = float(np.clip(alpha, 0.0, 1.0))
+    prev_pos = np.asarray(prev_pos, dtype=np.float64)
+    next_pos = np.asarray(next_pos, dtype=np.float64)
+    return ((1.0 - alpha) * prev_pos) + (alpha * next_pos)
+
+
+def blend_rotations(prev_R, next_R, alpha):
+    """Slerp-like interpolation between rotation matrices."""
+    if prev_R is None or alpha >= 1.0:
+        return next_R
+    alpha = float(np.clip(alpha, 0.0, 1.0))
+    R_prev = SciRot.from_matrix(prev_R)
+    R_next = SciRot.from_matrix(next_R)
+    delta = R_next * R_prev.inv()
+    step = SciRot.from_rotvec(delta.as_rotvec() * alpha)
+    return (step * R_prev).as_matrix()
 
 
 # ---------------------------------------------------------------------------
@@ -72,17 +106,8 @@ def _rotz_deg(deg):
 
 
 def stabilize_rotation_to_reference(R_mat, ref_R):
-    """Pick the 180-degree-equivalent closest to ref_R."""
-    if ref_R is None:
-        return R_mat
-    candidates = [
-        R_mat,
-        R_mat @ _rotx_deg(180.0),
-        R_mat @ _roty_deg(180.0),
-        R_mat @ _rotz_deg(180.0),
-    ]
-    best = min(candidates, key=lambda Rc: get_angular_distance(Rc, ref_R))
-    return best
+    """Keep a single physical frame; do not inject 180-degree alternatives."""
+    return R_mat
 
 
 def enforce_display_z_up(R_c_probe, R_probe_display_fix, ref_R=None):
@@ -111,9 +136,9 @@ DEFAULT_ROT_JUMP_DEG = 80.0
 
 
 def gate_and_filter_glitches(positions, rotations, prev_estimate, prev_rot,
-                             max_jump=0.40, pos_thresh=0.08,
+                             max_jump=0.15, pos_thresh=0.03,
                              rot_jump_deg=DEFAULT_ROT_JUMP_DEG,
-                             rot_thresh_deg=15.0):
+                             rot_thresh_deg=10.0, weights=None):
     """Reject outlier observations within a single frame.
 
     Parameters
@@ -129,7 +154,11 @@ def gate_and_filter_glitches(positions, rotations, prev_estimate, prev_rot,
     """
     n = len(positions)
     if n == 0:
-        return np.zeros((0, 3)), []
+        return np.zeros((0, 3)), [], np.zeros((0,), dtype=np.float64)
+
+    if weights is None:
+        weights = np.ones(n, dtype=np.float64)
+    weights = np.asarray(weights, dtype=np.float64)
 
     sane_indices = []
     for i in range(n):
@@ -137,7 +166,7 @@ def gate_and_filter_glitches(positions, rotations, prev_estimate, prev_rot,
         if np.isfinite(p).all() and p[2] > 0.0:
             sane_indices.append(i)
     if not sane_indices:
-        return np.zeros((0, 3)), []
+        return np.zeros((0, 3)), [], np.zeros((0,), dtype=np.float64)
 
     # Stabilize rotations vs last fused rotation
     if prev_rot is not None:
@@ -149,12 +178,10 @@ def gate_and_filter_glitches(positions, rotations, prev_estimate, prev_rot,
         p = positions[idx]
         if prev_estimate is not None:
             if np.linalg.norm(p - prev_estimate) > max_jump:
-                return np.zeros((0, 3)), []
-        if prev_rot is not None:
-            ang = get_angular_distance(rotations[idx], prev_rot)
-            if ang > rot_jump_deg:
-                return np.array([p]), []
-        return np.array([p]), [rotations[idx]]
+                return np.zeros((0, 3)), [], np.zeros((0,), dtype=np.float64)
+        # A single visible tag after a fast wrist rotation is still better than
+        # freezing the state on an outdated orientation.
+        return np.array([p]), [rotations[idx]], np.array([weights[idx]], dtype=np.float64)
 
     # Multiple observations: find best pivot
     if prev_rot is not None:
@@ -178,12 +205,11 @@ def gate_and_filter_glitches(positions, rotations, prev_estimate, prev_rot,
 
     clean_pos = []
     clean_rot = []
+    clean_weights = []
     for i in sane_indices:
         p = positions[i]
         R_mat = rotations[i]
         if prev_estimate is not None and np.linalg.norm(p - prev_estimate) > max_jump:
-            continue
-        if prev_rot is not None and get_angular_distance(R_mat, prev_rot) > (rot_jump_deg * 1.5):
             continue
         if np.linalg.norm(p - ref_P) > pos_thresh:
             continue
@@ -191,10 +217,15 @@ def gate_and_filter_glitches(positions, rotations, prev_estimate, prev_rot,
             continue
         clean_pos.append(p)
         clean_rot.append(R_mat)
+        clean_weights.append(weights[i])
 
     if not clean_pos:
-        return np.zeros((0, 3)), []
-    return np.array(clean_pos), clean_rot
+        return np.zeros((0, 3)), [], np.zeros((0,), dtype=np.float64)
+
+    clean_weights = np.asarray(clean_weights, dtype=np.float64)
+    clean_weights = np.clip(clean_weights, 1e-9, None)
+    clean_weights /= clean_weights.sum()
+    return np.array(clean_pos), clean_rot, clean_weights
 
 
 # ---------------------------------------------------------------------------
@@ -202,39 +233,70 @@ def gate_and_filter_glitches(positions, rotations, prev_estimate, prev_rot,
 # ---------------------------------------------------------------------------
 
 class ProbeParticleFilter:
-    """3-D position particle filter."""
+    """3-D constant-velocity particle filter."""
 
     def __init__(self, n_particles=3000, process_noise_std=0.002,
-                 meas_noise_std=0.015, init_spread=0.05):
+                 meas_noise_std=0.015, init_spread=0.02,
+                 velocity_noise_std=None, velocity_decay=0.92):
         self.n = n_particles
         self.process_noise_std = process_noise_std
         self.meas_noise_std = meas_noise_std
         self.init_spread = init_spread
+        self.velocity_noise_std = (
+            velocity_noise_std
+            if velocity_noise_std is not None
+            else max(0.001, process_noise_std * 6.0)
+        )
+        self.velocity_decay = float(np.clip(velocity_decay, 0.0, 1.0))
         self.particles = None   # (n, 3)
+        self.velocities = None  # (n, 3)
         self.weights = np.ones(n_particles) / n_particles
         self.initialized = False
 
-    def init_from_measurements(self, positions):
+    def init_from_measurements(self, positions, initial_velocity=None):
         """Scatter particles around the mean of the given positions (N,3)."""
         mean_pos = np.mean(positions, axis=0)
         self.particles = mean_pos + np.random.randn(self.n, 3) * self.init_spread
+        if initial_velocity is None:
+            initial_velocity = np.zeros(3, dtype=np.float64)
+        initial_velocity = np.asarray(initial_velocity, dtype=np.float64)
+        self.velocities = initial_velocity + (
+            np.random.randn(self.n, 3) * self.velocity_noise_std * 0.25
+        )
         self.weights = np.ones(self.n) / self.n
         self.initialized = True
 
-    def predict(self):
+    def predict(self, dt):
         if not self.initialized:
             return
-        self.particles += np.random.randn(self.n, 3) * self.process_noise_std
+        dt = float(np.clip(dt, 1e-3, 0.10))
+        frame_scale = np.sqrt(dt * 60.0)
+        pos_noise = self.process_noise_std * frame_scale
+        vel_noise = self.velocity_noise_std * frame_scale
+        self.velocities = (
+            self.velocities * self.velocity_decay
+            + (np.random.randn(self.n, 3) * vel_noise)
+        )
+        self.particles += (self.velocities * dt) + (
+            np.random.randn(self.n, 3) * pos_noise
+        )
 
-    def update(self, positions):
+    def update(self, positions, measurement_weights=None):
         """Update weights given positions array (N,3)."""
         if not self.initialized or len(positions) == 0:
             return
+        if measurement_weights is None:
+            measurement_weights = np.ones(len(positions), dtype=np.float64)
+        measurement_weights = np.asarray(measurement_weights, dtype=np.float64)
+        measurement_weights = np.clip(measurement_weights, 1e-9, None)
+        measurement_weights /= measurement_weights.sum()
         log_w = np.zeros(self.n)
-        for pos in positions:
+        for pos, meas_weight in zip(positions, measurement_weights):
             diff = self.particles - pos
             dist_sq = np.sum(diff ** 2, axis=1)
-            log_w -= dist_sq / (2.0 * self.meas_noise_std ** 2)
+            log_w -= (
+                meas_weight * dist_sq / (2.0 * self.meas_noise_std ** 2)
+            )
         log_w -= log_w.max()
         self.weights = np.exp(log_w)
         self.weights /= self.weights.sum() + 1e-300
@@ -247,6 +309,7 @@ class ProbeParticleFilter:
             u = u0 + np.arange(self.n) / self.n
             indices = np.searchsorted(cumsum, u)
             self.particles = self.particles[indices]
+            self.velocities = self.velocities[indices]
             self.weights = np.ones(self.n) / self.n
 
     def estimate_position(self):
@@ -254,3 +317,9 @@ class ProbeParticleFilter:
         if not self.initialized:
             return None
         return np.average(self.particles, axis=0, weights=self.weights)
+
+    def estimate_velocity(self):
+        """Return weighted mean velocity (3,) or None."""
+        if not self.initialized:
+            return None
+        return np.average(self.velocities, axis=0, weights=self.weights)

@@ -7,11 +7,11 @@ Last Updated: 6/11/2024
 
 MODE DESCRIPTION:
 -1: initialization
- 0: no input (red)
+ 0: idle (red)
  1: teleop (green)
  2: kinesthetic (yellow)
  3: natural (blue)
- 4: pre_natural (strobe blue)
+ 4: pre_natural (blue)
 """
 
 import numpy as np
@@ -20,7 +20,6 @@ from rclpy.node import Node
 from std_msgs.msg import String, Int32, Bool, Float32
 from geometry_msgs.msg import WrenchStamped
 from scipy.spatial.transform import Rotation as ScipyR
-import subprocess
 import time
 
 from tf2_ros import Buffer, TransformListener
@@ -31,17 +30,61 @@ class ModeHandler(Node):
     def __init__(self):
         super().__init__('mode_handler')
         self.declare_parameter('spacemouse_input_topic', '/ur7e/teleop_active')
+        self.declare_parameter('external_force_topic', '/uniforce/force')
+        self.declare_parameter('wrench_topic', '/force_torque_sensor_broadcaster/wrench')
+        self.declare_parameter('tool_frame', 'tool0')
+        self.declare_parameter('force_discrepancy_axis_sign', -1.0)
+        self.declare_parameter('kinesthetic_trigger_direction', -1.0)
+        self.declare_parameter('force_discrepancy_threshold_z', 4.0)
+        self.declare_parameter('force_discrepancy_release_threshold_z', 2.0)
+        self.declare_parameter('tool_contact_debounce_s', 0.5)
+        self.declare_parameter('external_force_default', 0.0)
+        self.declare_parameter('wrench_tare_samples', 50)
         self.spacemouse_input_topic = self.get_parameter('spacemouse_input_topic').value
+        self.external_force_topic = self.get_parameter('external_force_topic').value
+        self.wrench_topic = self.get_parameter('wrench_topic').value
+        self.tool_frame = self.get_parameter('tool_frame').value
+        self.force_discrepancy_axis_sign = float(
+            self.get_parameter('force_discrepancy_axis_sign').value
+        )
+        self.kinesthetic_trigger_direction = float(
+            self.get_parameter('kinesthetic_trigger_direction').value
+        )
+        if self.kinesthetic_trigger_direction == 0.0:
+            self.kinesthetic_trigger_direction = 1.0
+        else:
+            self.kinesthetic_trigger_direction = (
+                1.0 if self.kinesthetic_trigger_direction > 0.0 else -1.0
+            )
+        self.force_discrepancy_threshold_z = float(
+            self.get_parameter('force_discrepancy_threshold_z').value
+        )
+        self.force_discrepancy_release_threshold_z = float(
+            self.get_parameter('force_discrepancy_release_threshold_z').value
+        )
+        self.tool_contact_debounce_s = float(
+            self.get_parameter('tool_contact_debounce_s').value
+        )
+        self.external_force_default = float(
+            self.get_parameter('external_force_default').value
+        )
+        self.wrench_tare_samples = max(
+            0, int(self.get_parameter('wrench_tare_samples').value)
+        )
 
         # Initial state
         self.tool_contact = 1
-        self.tool_q = None
         self.curr_sm = False
-        self.uniforce = None
-        self.uniforce_time = None
+        self.external_force = self.external_force_default
         self.odom_seen = False
-        self.wrench_global = None
-        self.discrepancy_samps = 0
+        self.tool_force_z = 0.0
+        self.kinesthetic_armed = True
+        self.last_wrench = None
+        self.last_no_contact = None
+        self.wrench_bias_z = 0.0
+        self.wrench_tare_accum_z = 0.0
+        self.wrench_tare_count = 0
+        self.wrench_is_tared = (self.wrench_tare_samples == 0)
 
         # Publishers
         self.led_pub = self.create_publisher(String, '/led_state', 10)
@@ -56,9 +99,9 @@ class ModeHandler(Node):
         self.odom_sub = self.create_subscription(
             Bool, '/distance_odom_seen', self.store_odom_seen, 10)
         self.uniforce_sub = self.create_subscription(
-            Float32, '/uniforce/force', self.store_uni_force, 10)
+            Float32, self.external_force_topic, self.store_uni_force, 10)
         self.wrench_sub = self.create_subscription(
-            WrenchStamped, '/wrench_global', self.store_wrench_global, 10)
+            WrenchStamped, self.wrench_topic, self.store_wrench_global, 10)
         # Direct mode command subscriber
         self.mode_cmd_sub = self.create_subscription(
             Int32, '/mode_cmd', self.handle_mode_cmd, 10)
@@ -69,17 +112,25 @@ class ModeHandler(Node):
 
         # Timing
         self.start_mode_zero = time.time()
-        self.last_no_contact = None
         self.start_mode_four = None
 
         # Mode state
         self.mode = -1  # Start with initialization
         self.target_mode = None  # For handling direct mode commands
-        # Index maps to mode: 0=red, 1=green, 2=yellow, 3=blue, 4=strobe
-        self.mode_colors = {0: 'r', 1: 'g', 2: 'y', 3: 'b', 4: 's'}
+        self.mode_colors = {0: 'r', 1: 'g', 2: 'y', 3: 'b', 4: 'b'}
 
         self.get_logger().info('ModeHandler initialized, waiting for startup...')
         self.get_logger().info(f'SpaceMouse input topic: {self.spacemouse_input_topic}')
+        self.get_logger().info(f'Wrench topic: {self.wrench_topic}')
+        self.get_logger().info(f'External force topic: {self.external_force_topic}')
+        self.get_logger().info(
+            f'Kinesthetic trigger direction: {self.kinesthetic_trigger_direction:+.0f} '
+            '(+1 uses positive discrepancy, -1 uses negative discrepancy)'
+        )
+        if self.wrench_tare_samples > 0:
+            self.get_logger().info(
+                f'Taring wrench Z with first {self.wrench_tare_samples} samples'
+            )
 
         # Defer start so TF and other nodes can initialize
         self._init_timer = self.create_timer(2.0, self._start_processing)
@@ -93,14 +144,45 @@ class ModeHandler(Node):
         self.curr_sm = msg.data
 
     def store_uni_force(self, msg):
-        self.uniforce = msg.data
-        self.uniforce_time = self.get_clock().now()
+        self.external_force = msg.data
 
     def store_wrench_global(self, msg):
-        if self.uniforce_time is not None:
-            time_diff = (self.get_clock().now() - self.uniforce_time).nanoseconds / 1e9
-            if time_diff < 0.01:
-                self.wrench_global = msg.wrench
+        self.last_wrench = msg
+        force_tool = np.array(
+            [
+                msg.wrench.force.x,
+                msg.wrench.force.y,
+                msg.wrench.force.z,
+            ],
+            dtype=float,
+        )
+
+        source_frame = msg.header.frame_id if msg.header.frame_id else self.tool_frame
+        if source_frame != self.tool_frame:
+            try:
+                tf = self.tf_buffer.lookup_transform(
+                    self.tool_frame, source_frame, Time()
+                )
+                q = tf.transform.rotation
+                rot = np.array([q.x, q.y, q.z, q.w], dtype=float)
+                force_tool = ScipyR.from_quat(rot).apply(force_tool)
+            except Exception as exc:
+                self.get_logger().debug(f'Wrench TF lookup failed: {exc}')
+
+        raw_tool_force_z = float(force_tool[2])
+        if not self.wrench_is_tared:
+            self.wrench_tare_accum_z += raw_tool_force_z
+            self.wrench_tare_count += 1
+            self.tool_force_z = 0.0
+            if self.wrench_tare_count >= self.wrench_tare_samples:
+                self.wrench_bias_z = self.wrench_tare_accum_z / self.wrench_tare_count
+                self.wrench_is_tared = True
+                self.get_logger().info(
+                    f'Wrench tare complete. Z bias: {self.wrench_bias_z:.3f} N'
+                )
+            return
+
+        self.tool_force_z = raw_tool_force_z - self.wrench_bias_z
 
     def store_tool_contact(self, msg):
         self.tool_contact = msg.data
@@ -119,163 +201,80 @@ class ModeHandler(Node):
             self.get_logger().warn(f'Invalid mode command: {cmd_mode}')
 
     def force_discrepancy(self):
-        """Check for force discrepancy between uniforce and F/T sensor"""
-        if self.tool_q is not None and self.uniforce is not None and self.wrench_global is not None:
-            R_tool_global = ScipyR.from_quat(self.tool_q)
-            F_global = np.array([
-                self.wrench_global.force.x,
-                self.wrench_global.force.y,
-                self.wrench_global.force.z
-            ])
-            F_local = R_tool_global.inv().apply(F_global)
+        sensed_pull = self.force_discrepancy_axis_sign * self.tool_force_z
+        return sensed_pull - self.external_force
 
-            # Use sample counting to get around filter induced debouncing
-            if (F_local[2] - self.uniforce) > 10:  # Only when pulling down
-                self.discrepancy_samps += 1
-            else:
-                self.discrepancy_samps = 0
+    def attached(self):
+        return int(self.tool_contact) != 0
 
-            if self.discrepancy_samps >= 4:  # 4/5 seconds
-                return True
-
-        return False
+    def detached_stably(self):
+        if self.attached():
+            self.last_no_contact = None
+            return False
+        if self.last_no_contact is None:
+            self.last_no_contact = time.time()
+            return False
+        return (time.time() - self.last_no_contact) >= self.tool_contact_debounce_s
 
     def mode_processor(self):
         """Main mode processing loop"""
-        # Check tool location via TF
-        try:
-            trans = self.tf_buffer.lookup_transform('base', 'tool0', Time())
-            self.tool_q = np.array([
-                trans.transform.rotation.x,
-                trans.transform.rotation.y,
-                trans.transform.rotation.z,
-                trans.transform.rotation.w
-            ])
-        except Exception as e:
-            self.get_logger().debug(f'TF lookup failed: {e}')
-
         # Mode transitions
         new_mode = self.mode
 
         # Check for direct mode command override
+        manual_override = False
         if self.target_mode is not None:
             new_mode = self.target_mode
             self.target_mode = None  # Clear after using
+            manual_override = True
 
-        self.get_logger().debug(f'Current MODE: {self.mode}')
+        discrepancy = self.force_discrepancy()
+        directional_discrepancy = self.kinesthetic_trigger_direction * discrepancy
+        kinesthetic_requested = directional_discrepancy >= self.force_discrepancy_threshold_z
+        kinesthetic_released = directional_discrepancy <= self.force_discrepancy_release_threshold_z
+        if not self.wrench_is_tared:
+            kinesthetic_requested = False
+            kinesthetic_released = True
+        detached = self.detached_stably()
 
-        if self.mode == -1:
-            # Initialization -> idle
-            new_mode = 0
+        if kinesthetic_released:
+            self.kinesthetic_armed = True
 
-        elif self.mode == 0:
-            # Idle mode - can transition to 1, 2, or 4
-            if (time.time() - self.start_mode_zero) > 2.0:  # Debouncing
-                # Switch to Teleoperation (1)
-                if self.curr_sm:
-                    new_mode = 1
-
-                # Switch to Kinesthetic (2)
-                if self.force_discrepancy():
-                    new_mode = 2
-                    self.freedrive_pub.publish(Bool(data=True))
-
-                # Switch to pre-Natural (4)
-                if self.tool_contact == 0:
-                    if self.last_no_contact is None:
-                        self.last_no_contact = time.time()
-                    if (time.time() - self.last_no_contact) > 1:
-                        new_mode = 4
-                        self.start_mode_four = time.time()
-                else:
-                    self.last_no_contact = None
-
-        elif self.mode == 1:
-            # Teleoperation mode
-            # Change LED color based on force intensity
-            if self.wrench_global is not None:
-                F_global = np.array([
-                    self.wrench_global.force.x,
-                    self.wrench_global.force.y,
-                    self.wrench_global.force.z
-                ])
-                if np.linalg.norm(F_global) > 10:
-                    led_val = str(int((25 - np.linalg.norm(F_global)) / 3))
-                    self.led_pub.publish(String(data=led_val))
-                else:
-                    self.led_pub.publish(String(data=self.mode_colors[self.mode]))
-
-                # Play sound for force sensor
-                if self.uniforce is not None and abs(self.uniforce) > 0.75 * 9.8:
-                    freq = 66 * (abs(self.uniforce) - 0.7 * 9.8)
-                    subprocess.Popen(['play', '-nq', '-t', 'alsa', 'synth', '0.2', 'sine', str(freq)],
-                                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-
-                # Switch to Kinesthetic (2)
-                if self.force_discrepancy():
-                    new_mode = 2
-                    self.freedrive_pub.publish(Bool(data=True))
-
-                # Too much force also switches to kinesthetic
-                if self.uniforce is not None:
-                    if abs(self.uniforce) > 25 or np.linalg.norm(F_global) > 25:
-                        new_mode = 2
-                        self.freedrive_pub.publish(Bool(data=True))
-
-            # Switch to pre-Natural (4)
-            if self.tool_contact == 0:
-                if self.last_no_contact is None:
-                    self.last_no_contact = time.time()
-                if (time.time() - self.last_no_contact) > 1:
-                    new_mode = 4
+        if not manual_override:
+            if self.mode == -1:
+                new_mode = 4 if detached else 1
+            elif detached:
+                new_mode = 3 if self.odom_seen else 4
+                if self.mode not in (3, 4):
                     self.start_mode_four = time.time()
             else:
-                self.last_no_contact = None
-
-        elif self.mode == 2:
-            # Kinesthetic mode - continuously publish freedrive enable
-            self.freedrive_pub.publish(Bool(data=True))
-
-            # NOTE: Automatic switching to teleop disabled - use button to switch modes
-            # Switch to Teleoperation (1)
-            # if self.curr_sm:
-            #     new_mode = 1
-            #     self.freedrive_pub.publish(Bool(data=False))
-
-            # Switch to pre-Natural (4)
-            if self.tool_contact == 0:
-                if self.last_no_contact is None:
-                    self.last_no_contact = time.time()
-                if (time.time() - self.last_no_contact) > 2:
-                    new_mode = 4
-                    self.freedrive_pub.publish(Bool(data=False))
-                    self.start_mode_four = time.time()
-            else:
-                self.last_no_contact = None
-
-        elif self.mode == 3:
-            # Natural mode
-            # Switch to idle (0)
-            if self.tool_contact == 1:
-                new_mode = 0
+                # Reattaching the tool should always return to teleop.
                 self.start_mode_zero = time.time()
-
-        elif self.mode == 4:
-            # Pre-natural mode
-            if self.odom_seen:
-                new_mode = 3
-
-            # Switch to idle (0)
-            if self.start_mode_four is not None:
-                if self.tool_contact == 1 and (time.time() - self.start_mode_four) > 5:
-                    new_mode = 0
-                    self.start_mode_zero = time.time()
+                if self.mode in (3, 4):
+                    new_mode = 1
+                elif self.mode == 2:
+                    # Freedrive should only stay active while force is still applied.
+                    if self.curr_sm or kinesthetic_released:
+                        new_mode = 1
+                    else:
+                        new_mode = 2
+                elif self.curr_sm:
+                    new_mode = 1
+                elif kinesthetic_requested and self.kinesthetic_armed:
+                    new_mode = 2
+                    self.kinesthetic_armed = False
+                else:
+                    new_mode = 1
 
         # Set mode and command LEDs
         if new_mode != self.mode:
             self.mode = new_mode
             self.get_logger().info(f'Mode changed to: {self.mode}')
             self.led_pub.publish(String(data=self.mode_colors[self.mode]))
+        else:
+            self.led_pub.publish(String(data=self.mode_colors[self.mode]))
+
+        self.freedrive_pub.publish(Bool(data=(self.mode == 2)))
 
         # Always publish current mode
         mode_msg = Int32()

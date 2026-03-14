@@ -10,6 +10,13 @@ from launch_ros.actions import Node
 
 def generate_launch_description():
     return LaunchDescription([
+        Node(
+            package='mmdi',
+            executable='arduino_handler',
+            name='arduino_handler',
+            output='screen'
+        ),
+
         # Mode handler node
         Node(
             package='mmdi',

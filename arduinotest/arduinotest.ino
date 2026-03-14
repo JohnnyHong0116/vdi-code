@@ -5,14 +5,58 @@
 #define NUM_LEDS 11
 
 const uint8_t GLOBAL_BRIGHTNESS = 100; // modify for led brightness
+const unsigned long REPORT_PERIOD_MS = 50;
+const unsigned long STROBE_PERIOD_MS = 200;
 
 Adafruit_NeoPixel strip(NUM_LEDS, LED_PIN, NEO_GRB + NEO_KHZ800);
+char currentCommand = '\0';
+unsigned long lastReportMs = 0;
+unsigned long lastStrobeToggleMs = 0;
+bool strobeOn = false;
 
 void setAll(uint8_t r, uint8_t g, uint8_t b) {
   for (int i = 0; i < NUM_LEDS; i++) {
     strip.setPixelColor(i, strip.Color(r, g, b));
   }
   strip.show();
+}
+
+void applyCommand(char cmd, bool attached) {
+  switch (cmd) {
+    case 'r':
+      setAll(255, 0, 0);
+      break;
+    case 'g':
+      setAll(0, 255, 0);
+      break;
+    case 'b':
+      setAll(0, 0, 255);
+      break;
+    case 'y':
+      setAll(255, 180, 0);
+      break;
+    case 'e':
+      setAll(0, 0, 0);
+      break;
+    case 's':
+      if (millis() - lastStrobeToggleMs >= STROBE_PERIOD_MS) {
+        lastStrobeToggleMs = millis();
+        strobeOn = !strobeOn;
+      }
+      if (strobeOn) {
+        setAll(0, 0, 255);
+      } else {
+        setAll(0, 0, 0);
+      }
+      break;
+    default:
+      if (attached) {
+        setAll(0, 255, 0);
+      } else {
+        setAll(0, 0, 255);
+      }
+      break;
+  }
 }
 
 void setup() {
@@ -26,12 +70,21 @@ void setup() {
 
 void loop() {
   bool attached = (digitalRead(SWITCH_PIN) == LOW);
-
-  if (attached) {
-    setAll(0, 255, 0);   // green
-  } else {
-    setAll(0, 0, 255);   // blue
+  while (Serial.available() > 0) {
+    char incoming = (char)Serial.read();
+    if (incoming == '\n' || incoming == '\r') {
+      continue;
+    }
+    currentCommand = incoming;
   }
 
-  delay(100);
+  applyCommand(currentCommand, attached);
+
+  if (millis() - lastReportMs >= REPORT_PERIOD_MS) {
+    lastReportMs = millis();
+    Serial.print("0.0,");
+    Serial.println(attached ? 1 : 0);
+  }
+
+  delay(10);
 }

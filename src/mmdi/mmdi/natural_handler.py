@@ -342,6 +342,7 @@ class NaturalHandler(Node):
         self.last_twist_update_sec = None
         self._last_pose_for_vel = None  # (pos, quat, sec)
         self._warned_frame_mismatch = False
+        self._target_visible = False
 
         # TF fallback state
         self._last_tf_pose = None  # (pos, quat, sec)
@@ -399,6 +400,16 @@ class NaturalHandler(Node):
 
         if self.mode not in (3, 4):
             self.odom_seen_pub.publish(Bool(data=False))
+            self._target_visible = False
+
+    def _publish_target_visible(self, visible: bool):
+        visible = bool(visible)
+        if visible != self._target_visible:
+            self._target_visible = visible
+            self.odom_seen_pub.publish(Bool(data=visible))
+        elif visible:
+            # Keep publishing True periodically so mode_handler can stay in sync.
+            self.odom_seen_pub.publish(Bool(data=True))
 
     def _update_target_from_pose(
         self, pos: np.ndarray, quat: np.ndarray, cov: np.ndarray, stamp_sec: float
@@ -624,15 +635,18 @@ class NaturalHandler(Node):
 
         target_state = self._get_active_target_state()
         if target_state is None:
+            self._publish_target_visible(False)
             return
 
         tgt_pos, tgt_q, tgt_cov, tgt_vel, tgt_omega, stale_age = target_state
         if stale_age > self.hard_stale_sec:
+            self._publish_target_visible(False)
             self.get_logger().warn(
                 f"target stale for {stale_age:.2f}s; skipping command",
                 throttle_duration_sec=1.0,
             )
             return
+        self._publish_target_visible(True)
 
         try:
             trans_tool = self.tf_buffer.lookup_transform(

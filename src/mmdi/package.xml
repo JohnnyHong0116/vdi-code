@@ -19,6 +19,7 @@
   <exec_depend>sensor_msgs</exec_depend>
   <exec_depend>visualization_msgs</exec_depend>
   <exec_depend>cv_bridge</exec_depend>
+  <exec_depend>python3-serial</exec_depend>
 
   <!-- External ROS 2 packages -->
   <!-- Launch dependencies -->
