@@ -24,7 +24,6 @@ class SMTeleop(Node):
         self.declare_parameter('teleop_active_hold_s', 0.25)
 
         self.declare_parameter('w_lin', 0.02)   # meters per tick * spacemouse unit
-        self.declare_parameter('w_lin_z', 0.02)   # independent z scaling
         self.declare_parameter('w_ang', 0.05)   # rad per tick * spacemouse unit
 
         self.base_frame = self.get_parameter('base_frame').value
@@ -33,32 +32,13 @@ class SMTeleop(Node):
         self.teleop_active_topic = self.get_parameter('teleop_active_topic').value
         self.rate_hz = float(self.get_parameter('rate_hz').value)
         self.w_lin = float(self.get_parameter('w_lin').value)
-        self.w_lin_z = float(self.get_parameter('w_lin_z').value)
         self.w_ang = float(self.get_parameter('w_ang').value)
         self.active_hold_s = float(self.get_parameter('teleop_active_hold_s').value)
         self.active_hold_ns = int(max(0.0, self.active_hold_s) * 1e9)
 
-        # Deadbands and zero tracking to prevent drift.
-        self.declare_parameter('deadband_xy', 0.15)
-        self.declare_parameter('deadband_z', 0.30)
-        self.declare_parameter('deadband_rot', 0.15)
-        self.declare_parameter('bias_alpha', 0.03)
-        self.declare_parameter('bias_update_threshold', 0.12)
-        self.deadband_xy = float(self.get_parameter('deadband_xy').value)
-        self.deadband_z = float(self.get_parameter('deadband_z').value)
-        self.deadband_rot = float(self.get_parameter('deadband_rot').value)
-        self.bias_alpha = float(self.get_parameter('bias_alpha').value)
-        self.bias_update_threshold = float(
-            self.get_parameter('bias_update_threshold').value
-        )
-        self.bias = {
-            'x': 0.0,
-            'y': 0.0,
-            'z': 0.0,
-            'roll': 0.0,
-            'pitch': 0.0,
-            'yaw': 0.0,
-        }
+        # Deadband to prevent drift
+        self.declare_parameter('deadband', 0.15)
+        self.deadband = float(self.get_parameter('deadband').value)
 
         # TF
         self.tf_buffer = tf2_ros.Buffer()
@@ -101,19 +81,10 @@ class SMTeleop(Node):
         self.get_logger().info(f"sm_teleop active topic {self.teleop_active_topic}")
         self.get_logger().info(f"TF: {self.base_frame} -> {self.tool_frame}")
 
-    def apply_deadband(self, val, deadband):
-        if abs(val) < deadband:
+    def apply_deadband(self, val):
+        if abs(val) < self.deadband:
             return 0.0
         return val
-
-    def _update_bias(self, raw):
-        alpha = min(max(self.bias_alpha, 0.0), 1.0)
-        if alpha <= 0.0:
-            return
-        threshold = max(self.bias_update_threshold, 0.0)
-        for key, value in raw.items():
-            if abs(value - self.bias[key]) <= threshold:
-                self.bias[key] = (1.0 - alpha) * self.bias[key] + alpha * value
 
     def tick(self):
         # 1) Get Actual Robot Pose (latest available)
@@ -166,23 +137,13 @@ class SMTeleop(Node):
         rx, ry, rz = 0.0, 0.0, 0.0
 
         if sm_state is not None:
-            raw = {
-                'x': float(sm_state.x),
-                'y': float(sm_state.y),
-                'z': float(sm_state.z),
-                'roll': float(sm_state.roll),
-                'pitch': float(sm_state.pitch),
-                'yaw': float(sm_state.yaw),
-            }
-            self._update_bias(raw)
-
-            # Bias-correct before deadband so small offsets don't integrate forever.
-            lx = self.apply_deadband(raw['x'] - self.bias['x'], self.deadband_xy)
-            ly = self.apply_deadband(raw['y'] - self.bias['y'], self.deadband_xy)
-            lz = self.apply_deadband(raw['z'] - self.bias['z'], self.deadband_z)
-            rx = self.apply_deadband(raw['roll'] - self.bias['roll'], self.deadband_rot)
-            ry = self.apply_deadband(raw['pitch'] - self.bias['pitch'], self.deadband_rot)
-            rz = self.apply_deadband(raw['yaw'] - self.bias['yaw'], self.deadband_rot)
+            # Apply deadband
+            lx = self.apply_deadband(sm_state.x)
+            ly = self.apply_deadband(sm_state.y)
+            lz = self.apply_deadband(sm_state.z)
+            rx = self.apply_deadband(sm_state.roll)
+            ry = self.apply_deadband(sm_state.pitch)
+            rz = self.apply_deadband(sm_state.yaw)
 
         # Check for Idle (All zeros)
         is_idle = (lx == 0.0 and ly == 0.0 and lz == 0.0 and
@@ -210,7 +171,7 @@ class SMTeleop(Node):
             # INTEGRATE INPUT
             self.curr_pos[0] += self.w_lin * ly
             self.curr_pos[1] -= self.w_lin * lx  # Inverted Y
-            self.curr_pos[2] += self.w_lin_z * lz
+            self.curr_pos[2] += self.w_lin * lz
 
             # Rotation
             rot_x = rx
