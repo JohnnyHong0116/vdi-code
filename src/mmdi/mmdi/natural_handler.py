@@ -38,6 +38,14 @@ def _quat_from_msg(qmsg) -> np.ndarray:
     return np.array([qmsg.x, qmsg.y, qmsg.z, qmsg.w], dtype=float)
 
 
+def _twist_is_informative(lin: np.ndarray, ang: np.ndarray, eps: float = 1e-6) -> bool:
+    return bool(
+        np.all(np.isfinite(lin))
+        and np.all(np.isfinite(ang))
+        and (np.linalg.norm(lin) > eps or np.linalg.norm(ang) > eps)
+    )
+
+
 def _predict_target_state(
     tgt_pos: np.ndarray,
     tgt_q: np.ndarray,
@@ -254,7 +262,7 @@ class NaturalHandler(Node):
         self.declare_parameter("max_angular_deviation", 0.9)
 
         # View objective
-        self.declare_parameter("distance_objective_mode", "camera_z")
+        self.declare_parameter("distance_objective_mode", "euclidean")
         self.declare_parameter("desired_distance", 0.30)
         self.declare_parameter("desired_view_cos", 0.7071)
 
@@ -366,7 +374,7 @@ class NaturalHandler(Node):
             self.get_parameter("distance_objective_mode").value
         ).strip().lower()
         if self.distance_objective_mode not in ("camera_z", "euclidean"):
-            self.distance_objective_mode = "camera_z"
+            self.distance_objective_mode = "euclidean"
 
         self.left_cart_mins = np.array(
             [
@@ -672,15 +680,18 @@ class NaturalHandler(Node):
             )
             quat = _quat_from_msg(msg.pose.pose.orientation)
             self._update_target_from_pose(pos, quat, cov, _stamp_to_sec(msg.header.stamp))
-            self.tgt_vel = np.array(
+            lin = np.array(
                 [msg.twist.twist.linear.x, msg.twist.twist.linear.y, msg.twist.twist.linear.z],
                 dtype=float,
             )
-            self.tgt_omega = np.array(
+            ang = np.array(
                 [msg.twist.twist.angular.x, msg.twist.twist.angular.y, msg.twist.twist.angular.z],
                 dtype=float,
             )
-            self.last_twist_update_sec = self._now_sec()
+            if _twist_is_informative(lin, ang):
+                self.tgt_vel = lin
+                self.tgt_omega = ang
+                self.last_twist_update_sec = self._now_sec()
             return
 
         # Transform odom pose from source frame to base frame.
@@ -717,9 +728,12 @@ class NaturalHandler(Node):
             [msg.twist.twist.angular.x, msg.twist.twist.angular.y, msg.twist.twist.angular.z],
             dtype=float,
         )
-        self.tgt_vel = r_bf.apply(lin_f)
-        self.tgt_omega = r_bf.apply(ang_f)
-        self.last_twist_update_sec = self._now_sec()
+        lin_base = r_bf.apply(lin_f)
+        ang_base = r_bf.apply(ang_f)
+        if _twist_is_informative(lin_base, ang_base):
+            self.tgt_vel = lin_base
+            self.tgt_omega = ang_base
+            self.last_twist_update_sec = self._now_sec()
 
     def _select_priority_marker(self, markers):
         candidates = []
@@ -1245,6 +1259,21 @@ class NaturalHandler(Node):
     def _get_active_target_state(self):
         now_sec = self._now_sec()
 
+        # Prefer the more stable fused target state for camera optimization.
+        # Priority tags still contribute visibility proxy points and can take
+        # over only when fused tracking drops out.
+        if self.tgt_pos is not None and self.tgt_q is not None and self.last_target_update_sec is not None:
+            age = now_sec - self.last_target_update_sec
+            if age <= self.external_target_timeout_sec:
+                return (
+                    self.tgt_pos.copy(),
+                    self.tgt_q.copy(),
+                    self.tgt_cov.copy(),
+                    self.tgt_vel.copy(),
+                    self.tgt_omega.copy(),
+                    age,
+                )
+
         if (
             self.use_priority_tag_tracking
             and self.tag_tgt_pos is not None
@@ -1259,19 +1288,6 @@ class NaturalHandler(Node):
                     self.tag_tgt_cov.copy(),
                     self.tag_tgt_vel.copy(),
                     self.tag_tgt_omega.copy(),
-                    age,
-                )
-
-        # Prefer external fused state when fresh.
-        if self.tgt_pos is not None and self.tgt_q is not None and self.last_target_update_sec is not None:
-            age = now_sec - self.last_target_update_sec
-            if age <= self.external_target_timeout_sec:
-                return (
-                    self.tgt_pos.copy(),
-                    self.tgt_q.copy(),
-                    self.tgt_cov.copy(),
-                    self.tgt_vel.copy(),
-                    self.tgt_omega.copy(),
                     age,
                 )
 

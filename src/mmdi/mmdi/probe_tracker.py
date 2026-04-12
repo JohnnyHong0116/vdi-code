@@ -392,6 +392,9 @@ class ProbeTracker(Node):
         self.prev_velocity = np.zeros(3, dtype=np.float64)
         self.last_process_time = None
         self.last_measurement_time = None
+        self.last_fused_publish_sec = None
+        self.last_fused_publish_pos = None
+        self.last_fused_publish_rot = None
 
         # ---- ArUco detector (OpenCV 4.6 legacy API) -------------------------
         self.aruco_dict = cv2.aruco.Dictionary_get(cv2.aruco.DICT_4X4_50)
@@ -735,8 +738,11 @@ class ProbeTracker(Node):
         now = now_time.to_msg()
         if fused_pos is not None and fused_rot is not None:
             quat = SciRot.from_matrix(fused_rot).as_quat()  # xyzw
+            fused_lin_vel, fused_ang_vel = self._estimate_fused_twist(
+                fused_pos, fused_rot, now_sec
+            )
             self._publish_tf(fused_pos, quat, now)
-            self._publish_vo(fused_pos, quat, now)
+            self._publish_vo(fused_pos, quat, fused_lin_vel, fused_ang_vel, now)
         self._publish_markers(detected_tag_poses, fused_pos, fused_rot, now)
 
         # Debug image + GUI
@@ -788,7 +794,35 @@ class ProbeTracker(Node):
         t.transform.rotation.w = float(quat[3])
         self.tf_broadcaster.sendTransform(t)
 
-    def _publish_vo(self, pos, quat, stamp):
+    def _estimate_fused_twist(self, pos, rot, now_sec):
+        if (
+            self.last_fused_publish_sec is None
+            or self.last_fused_publish_pos is None
+            or self.last_fused_publish_rot is None
+            or now_sec <= self.last_fused_publish_sec
+        ):
+            lin_vel = (
+                self.prev_velocity.copy()
+                if self.prev_velocity is not None
+                else np.zeros(3, dtype=np.float64)
+            )
+            ang_vel = np.zeros(3, dtype=np.float64)
+        else:
+            dt = max(now_sec - self.last_fused_publish_sec, 1e-6)
+            lin_vel = (
+                np.asarray(pos, dtype=np.float64) - self.last_fused_publish_pos
+            ) / dt
+            rot_delta = SciRot.from_matrix(rot) * SciRot.from_matrix(
+                self.last_fused_publish_rot
+            ).inv()
+            ang_vel = rot_delta.as_rotvec() / dt
+
+        self.last_fused_publish_sec = now_sec
+        self.last_fused_publish_pos = np.asarray(pos, dtype=np.float64).copy()
+        self.last_fused_publish_rot = np.asarray(rot, dtype=np.float64).copy()
+        return lin_vel, ang_vel
+
+    def _publish_vo(self, pos, quat, lin_vel, ang_vel, stamp):
         msg = Odometry()
         msg.header.stamp = stamp
         msg.header.frame_id = self.stream_frame_label
@@ -800,8 +834,15 @@ class ProbeTracker(Node):
         msg.pose.pose.orientation.y = float(quat[1])
         msg.pose.pose.orientation.z = float(quat[2])
         msg.pose.pose.orientation.w = float(quat[3])
+        msg.twist.twist.linear.x = float(lin_vel[0])
+        msg.twist.twist.linear.y = float(lin_vel[1])
+        msg.twist.twist.linear.z = float(lin_vel[2])
+        msg.twist.twist.angular.x = float(ang_vel[0])
+        msg.twist.twist.angular.y = float(ang_vel[1])
+        msg.twist.twist.angular.z = float(ang_vel[2])
         cov = (0.01 * np.eye(6)).astype(float).ravel().tolist()
         msg.pose.covariance = cov
+        msg.twist.covariance = cov
         self.vo_pub.publish(msg)
 
     def _publish_debug(self, frame, stamp):
