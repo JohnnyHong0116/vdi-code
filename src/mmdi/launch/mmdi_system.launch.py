@@ -55,22 +55,31 @@ def generate_launch_description():
 
         # Static transform: hande_link_tool -> head_camera
         # Measured camera mount:
-        #   translation: x=-0.037 m, y=+0.104 m, z=0.0 m
-        #   orientation assumption: 30 deg downward tilt toward (-y, -z),
-        #   modeled as +30 deg rotation about +x:
-        #   q = [0.2588190451, 0.0, 0.0, 0.9659258263]
+        #   camera center in tool0 frame:
+        #     x=+99.47 mm, y=+19.59 mm, z=+78.76 mm
+        #   hande_link_tool axes map into tool0 as:
+        #     +X_hande -> +Y_tool0, +Y_hande -> +X_tool0, +Z_hande -> -Z_tool0
+        #   so the translation in hande_link_tool is:
+        #     x=+0.01959 m, y=+0.09947 m, z=-0.07876 m
+        #   camera axes in tool0 should be:
+        #     x_cam = -y_tool0
+        #   then rotate +30 deg about the current camera x-axis:
+        #     y_cam =  cos(30) * x_tool0 + sin(30) * z_tool0
+        #     z_cam = -sin(30) * x_tool0 + cos(30) * z_tool0
+        #   with the existing hande_link_tool alignment, this corresponds to:
+        #   q = [0.0, 0.9659258263, -0.2588190451, 0.0]
         Node(
             package='tf2_ros',
             executable='static_transform_publisher',
             name='camera_frame_converter',
             arguments=[
-                '--x', '-0.037',
-                '--y', '0.104',
-                '--z', '0.0',
-                '--qx', '0.2588190451',
-                '--qy', '0.0',
-                '--qz', '0.0',
-                '--qw', '0.9659258263',
+                '--x', '0.01959',
+                '--y', '0.09947',
+                '--z', '-0.07876',
+                '--qx', '0.0',
+                '--qy', '0.9659258263',
+                '--qz', '-0.2588190451',
+                '--qw', '0.0',
                 '--frame-id', 'hande_link_tool',
                 '--child-frame-id', 'head_camera'
             ]

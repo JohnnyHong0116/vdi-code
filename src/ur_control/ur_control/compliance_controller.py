@@ -142,6 +142,9 @@ class ComplianceController(Node):
         self.get_logger().info(f"Wrench: {self.wrench_topic} (tool_frame={self.tool_frame})")
         self.get_logger().info(f"Disable compliance in mode 2: {self.disable_compliance_in_mode2}")
 
+    def _natural_mode_active(self) -> bool:
+        return self.mode in (3, 4)
+
     # ------------------------------------------------------------------ #
     # Callbacks
     def on_target_pose(self, msg: PoseStamped):
@@ -157,7 +160,13 @@ class ComplianceController(Node):
             msg.pose.orientation.w
         ], dtype=float)
 
-        if (self.engaged and self.freeze_on_contact and self.ignore_updates_engaged and not self.teleop_active):
+        if (
+            self.engaged
+            and self.freeze_on_contact
+            and self.ignore_updates_engaged
+            and not self.teleop_active
+            and not self._natural_mode_active()
+        ):
             self.pending_pos = pos
             self.pending_q = quat
             return
@@ -165,7 +174,11 @@ class ComplianceController(Node):
         self.desired_pos = pos
         self.desired_q = quat
         # If teleop is moving while engaged, advance the freeze anchor with teleop targets.
-        if self.engaged and self.freeze_on_contact and self.teleop_active:
+        if (
+            self.engaged
+            and self.freeze_on_contact
+            and (self.teleop_active or self._natural_mode_active())
+        ):
             self.anchor_pos = pos.copy()
             self.anchor_q = quat.copy()
 
@@ -291,7 +304,12 @@ class ComplianceController(Node):
                 self.pending_q = None
 
         # Select reference pose
-        if self.freeze_on_contact and self.anchor_pos is not None and not self.teleop_active:
+        if (
+            self.freeze_on_contact
+            and self.anchor_pos is not None
+            and not self.teleop_active
+            and not self._natural_mode_active()
+        ):
             ref_pos = self.anchor_pos
             ref_q = self.anchor_q
         else:

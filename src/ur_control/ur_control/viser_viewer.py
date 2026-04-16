@@ -27,12 +27,14 @@ class ViserViewer(Node):
         # Parameters
         self.declare_parameter('base_frame', 'base')
         self.declare_parameter('tool_frame', 'tool0')
+        self.declare_parameter('camera_frame', 'head_camera')
         self.declare_parameter('desired_pose_topic', '/ur7e/desired_pose')
         self.declare_parameter('rate_hz', 450.0)
         self.declare_parameter('viser_host', '0.0.0.0')
         self.declare_parameter('viser_port', 8080)
         self.declare_parameter('show_actual_pose', True)
         self.declare_parameter('show_desired_pose', True)
+        self.declare_parameter('show_camera_pose', True)
         self.declare_parameter('grid_size', 2.0)
         self.declare_parameter('axes_length', 0.2)
         self.declare_parameter('axes_radius', 0.01)
@@ -48,12 +50,14 @@ class ViserViewer(Node):
 
         self.base_frame = self.get_parameter('base_frame').value
         self.tool_frame = self.get_parameter('tool_frame').value
+        self.camera_frame = self.get_parameter('camera_frame').value
         self.desired_pose_topic = self.get_parameter('desired_pose_topic').value
         self.rate_hz = float(self.get_parameter('rate_hz').value)
         self.viser_host = self.get_parameter('viser_host').value
         self.viser_port = int(self.get_parameter('viser_port').value)
         self.show_actual = bool(self.get_parameter('show_actual_pose').value)
         self.show_desired = bool(self.get_parameter('show_desired_pose').value)
+        self.show_camera = bool(self.get_parameter('show_camera_pose').value)
         self.grid_size = float(self.get_parameter('grid_size').value)
         self.axes_length = float(self.get_parameter('axes_length').value)
         self.axes_radius = float(self.get_parameter('axes_radius').value)
@@ -122,6 +126,16 @@ class ViserViewer(Node):
                 origin_color=(0, 255, 0),
             )
 
+        self.camera_handle = None
+        if self.show_camera:
+            self.camera_handle = self.scene.add_frame(
+                'camera',
+                show_axes=True,
+                axes_length=self.axes_length,
+                axes_radius=self.axes_radius,
+                origin_color=(0, 128, 255),
+            )
+
         self.des_handle = None
         if self.show_desired:
             self.des_handle = self.scene.add_frame(
@@ -163,6 +177,7 @@ class ViserViewer(Node):
         self.get_logger().info(
             f"Viser server at http://{self.viser_host}:{self.viser_port} "
             f"(base={self.base_frame}, tool={self.tool_frame}, "
+            f"camera={self.camera_frame}, "
             f"robot={self.robot_description})"
         )
 
@@ -436,42 +451,74 @@ class ViserViewer(Node):
     def tick(self):
         self.update_robot_alignment()
 
-        if self.tool_handle is None:
+        if self.tool_handle is None and self.camera_handle is None:
             return
 
-        try:
-            trans = self.tf_buffer.lookup_transform(
-                self.base_frame,
-                self.tool_frame,
-                rclpy.time.Time(),
-            )
-        except Exception as ex:
-            if not self.warned_tf:
-                self.get_logger().warn(
-                    f"TF lookup failed ({self.base_frame} -> "
-                    f"{self.tool_frame}): {ex}"
+        if self.tool_handle is not None:
+            try:
+                trans = self.tf_buffer.lookup_transform(
+                    self.base_frame,
+                    self.tool_frame,
+                    rclpy.time.Time(),
                 )
-                self.warned_tf = True
-            return
+                pos = np.array(
+                    [
+                        trans.transform.translation.x,
+                        trans.transform.translation.y,
+                        trans.transform.translation.z,
+                    ],
+                    dtype=float,
+                )
+                quat = np.array(
+                    [
+                        trans.transform.rotation.x,
+                        trans.transform.rotation.y,
+                        trans.transform.rotation.z,
+                        trans.transform.rotation.w,
+                    ],
+                    dtype=float,
+                )
+                self.update_handle(self.tool_handle, pos, quat)
+            except Exception as ex:
+                if not self.warned_tf:
+                    self.get_logger().warn(
+                        f"TF lookup failed ({self.base_frame} -> "
+                        f"{self.tool_frame}): {ex}"
+                    )
+                    self.warned_tf = True
 
-        pos = np.array(
-            [
-                trans.transform.translation.x,
-                trans.transform.translation.y,
-                trans.transform.translation.z,
-            ],
-            dtype=float,
-        )
-        quat = np.array(
-            [
-                trans.transform.rotation.x,
-                trans.transform.rotation.y,
-                trans.transform.rotation.z,
-                trans.transform.rotation.w,
-            ],
-            dtype=float,
-        )
-        self.update_handle(self.tool_handle, pos, quat)
+        if self.camera_handle is not None:
+            try:
+                trans = self.tf_buffer.lookup_transform(
+                    self.base_frame,
+                    self.camera_frame,
+                    rclpy.time.Time(),
+                )
+                pos = np.array(
+                    [
+                        trans.transform.translation.x,
+                        trans.transform.translation.y,
+                        trans.transform.translation.z,
+                    ],
+                    dtype=float,
+                )
+                quat = np.array(
+                    [
+                        trans.transform.rotation.x,
+                        trans.transform.rotation.y,
+                        trans.transform.rotation.z,
+                        trans.transform.rotation.w,
+                    ],
+                    dtype=float,
+                )
+                self.update_handle(self.camera_handle, pos, quat)
+            except Exception as ex:
+                if not self.warned_tf:
+                    self.get_logger().warn(
+                        f"TF lookup failed ({self.base_frame} -> "
+                        f"{self.camera_frame}): {ex}"
+                    )
+                    self.warned_tf = True
 
 
 def main():

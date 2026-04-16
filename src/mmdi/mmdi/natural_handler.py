@@ -111,6 +111,12 @@ def _camera_pose_residual(
     distance_objective_mode: str,
     desired_dist: float,
     desired_view_cos: float,
+    delta_pos_scale: float,
+    delta_rot_scale: float,
+    nominal_tool_pos: np.ndarray,
+    nominal_pos_span: np.ndarray,
+    nominal_pos_axis_weights: np.ndarray,
+    rotation_penalty_scale: float,
 ) -> float:
     tool_pos = curr_pos + x[:3]
     tool_rotvec = curr_rotvec + x[3:6]
@@ -145,10 +151,12 @@ def _camera_pose_residual(
     unc = float(np.clip(pos_cov_trace, 1e-6, 5e-2))
     w_track = 120.0 / (1.0 + 40.0 * unc)
     w_align = 80.0 / (1.0 + 40.0 * unc)
-    w_view = 20.0 / (1.0 + 40.0 * unc)
-    w_vis = 60.0 * (1.0 + 20.0 * unc)
-    w_smooth = 4.0 * (1.0 + 40.0 * unc)
-    w_step = 0.8 * (1.0 + 40.0 * unc)
+    w_view = 8.0 / (1.0 + 40.0 * unc)
+    w_center = 90.0 / (1.0 + 40.0 * unc)
+    w_vis = 40.0 * (1.0 + 20.0 * unc)
+    w_nominal = 10.0
+    w_smooth = 2.5 * (1.0 + 40.0 * unc)
+    w_step = 1.5 * (1.0 + 40.0 * unc)
 
     vec_ct = tgt_pos_d - cam_pos
     dist = np.linalg.norm(vec_ct) + 1e-9
@@ -170,8 +178,15 @@ def _camera_pose_residual(
         cam_pos, cam_q, tgt_pos_d, tgt_q_d, tgt_points, fx, fy, cx, cy
     )
     if (not valid) or uv.shape[0] == 0:
+        loss_center = 1e2
         loss_vis = 1e3
     else:
+        uv_center = np.mean(uv, axis=0)
+        uv_center_err = (uv_center - np.array([cx, cy], dtype=float)) / np.array(
+            [max(img_w, 1.0), max(img_h, 1.0)],
+            dtype=float,
+        )
+        loss_center = float(np.dot(uv_center_err, uv_center_err))
         margins = np.minimum.reduce(
             [
                 uv[:, 0],
@@ -182,16 +197,45 @@ def _camera_pose_residual(
         )
         loss_vis = float(np.sum(_softplus((safe_margin_px - margins) / 6.0)))
 
-    cmd_rate = (x - prev_cmd) / max(dt_ctrl, 1e-6)
-    cmd_jerk = (x - 2.0 * prev_cmd + prev_prev_cmd) / max(dt_ctrl * dt_ctrl, 1e-6)
-    loss_smooth = float(np.dot(cmd_rate, cmd_rate) + 0.1 * np.dot(cmd_jerk, cmd_jerk))
-    loss_step = float(np.dot(x, x))
+    pos_scale = max(delta_pos_scale, 1e-6)
+    rot_scale = max(delta_rot_scale, 1e-6)
+    rot_weight = float(max(rotation_penalty_scale, 1e-3))
+
+    x_pos_scaled = x[:3] / pos_scale
+    x_rot_scaled = x[3:6] / rot_scale
+    prev_pos_scaled = prev_cmd[:3] / pos_scale
+    prev_rot_scaled = prev_cmd[3:6] / rot_scale
+    prev_prev_pos_scaled = prev_prev_cmd[:3] / pos_scale
+    prev_prev_rot_scaled = prev_prev_cmd[3:6] / rot_scale
+
+    pos_rate = (x_pos_scaled - prev_pos_scaled) / max(dt_ctrl, 1e-6)
+    rot_rate = (x_rot_scaled - prev_rot_scaled) / max(dt_ctrl, 1e-6)
+    pos_jerk = (x_pos_scaled - 2.0 * prev_pos_scaled + prev_prev_pos_scaled) / max(
+        dt_ctrl * dt_ctrl, 1e-6
+    )
+    rot_jerk = (x_rot_scaled - 2.0 * prev_rot_scaled + prev_prev_rot_scaled) / max(
+        dt_ctrl * dt_ctrl, 1e-6
+    )
+    loss_smooth = float(
+        np.dot(pos_rate, pos_rate)
+        + 0.1 * np.dot(pos_jerk, pos_jerk)
+        + rot_weight * (np.dot(rot_rate, rot_rate) + 0.1 * np.dot(rot_jerk, rot_jerk))
+    )
+    loss_step = float(
+        np.dot(x_pos_scaled, x_pos_scaled)
+        + rot_weight * np.dot(x_rot_scaled, x_rot_scaled)
+    )
+
+    nominal_err = (tool_pos - nominal_tool_pos) / nominal_pos_span
+    loss_nominal = float(np.dot(nominal_pos_axis_weights * nominal_err, nominal_err))
 
     return (
         w_track * loss_track
         + w_align * loss_align
         + w_view * loss_view
+        + w_center * loss_center
         + w_vis * loss_vis
+        + w_nominal * loss_nominal
         + w_smooth * loss_smooth
         + w_step * loss_step
     )
@@ -262,9 +306,16 @@ class NaturalHandler(Node):
         self.declare_parameter("max_angular_deviation", 0.9)
 
         # View objective
-        self.declare_parameter("distance_objective_mode", "euclidean")
+        self.declare_parameter("distance_objective_mode", "camera_z")
         self.declare_parameter("desired_distance", 0.30)
         self.declare_parameter("desired_view_cos", 0.7071)
+        self.declare_parameter("nominal_x_fraction", 0.12)
+        self.declare_parameter("nominal_y_fraction", 0.50)
+        self.declare_parameter("nominal_z_fraction", 0.15)
+        self.declare_parameter("nominal_x_axis_weight", 1.5)
+        self.declare_parameter("nominal_y_axis_weight", 0.25)
+        self.declare_parameter("nominal_z_axis_weight", 1.5)
+        self.declare_parameter("rotation_penalty_scale", 0.08)
 
         # Image model for visibility barrier
         self.declare_parameter("fx", 615.0)
@@ -416,6 +467,25 @@ class NaturalHandler(Node):
 
         self.desired_dist = float(self.get_parameter("desired_distance").value)
         self.desired_view_cos = float(self.get_parameter("desired_view_cos").value)
+        self.nominal_fractions = np.array(
+            [
+                float(self.get_parameter("nominal_x_fraction").value),
+                float(self.get_parameter("nominal_y_fraction").value),
+                float(self.get_parameter("nominal_z_fraction").value),
+            ],
+            dtype=float,
+        )
+        self.nominal_axis_weights = np.array(
+            [
+                float(self.get_parameter("nominal_x_axis_weight").value),
+                float(self.get_parameter("nominal_y_axis_weight").value),
+                float(self.get_parameter("nominal_z_axis_weight").value),
+            ],
+            dtype=float,
+        )
+        self.rotation_penalty_scale = float(
+            self.get_parameter("rotation_penalty_scale").value
+        )
 
         self.fx = float(self.get_parameter("fx").value)
         self.fy = float(self.get_parameter("fy").value)
@@ -438,6 +508,7 @@ class NaturalHandler(Node):
         # Mode/state
         self.mode = 0
         self.start_mode3_q = None
+        self.start_mode3_pos = None
 
         # External fused target state
         self.tgt_pos = None
@@ -533,6 +604,12 @@ class NaturalHandler(Node):
         self.get_logger().info(
             f"distance objective: desired_distance={self.desired_dist:.3f} m"
         )
+        self.get_logger().info(
+            "optimizer bias: "
+            f"mode={self.distance_objective_mode}, "
+            f"nominal_frac={np.round(self.nominal_fractions, 2).tolist()}, "
+            f"rotation_penalty_scale={self.rotation_penalty_scale:.2f}"
+        )
         self.get_logger().info(f"workspace_side mode: {self.workspace_side}")
         self.get_logger().info(
             f"left box  x[{self.left_cart_mins[0]:.3f},{self.left_cart_maxs[0]:.3f}] "
@@ -556,6 +633,7 @@ class NaturalHandler(Node):
             self.prev_cmd[:] = 0.0
             self.prev_prev_cmd[:] = 0.0
             self.start_mode3_q = None
+            self.start_mode3_pos = None
         if prev_mode != 4 and self.mode == 4:
             self.pre_nat_search_started = False
             self.pre_nat_search_waypoints = []
@@ -565,6 +643,7 @@ class NaturalHandler(Node):
             self.pre_nat_search_orientation = None
         elif self.mode != 3:
             self.start_mode3_q = None
+            self.start_mode3_pos = None
 
         if self.mode not in (3, 4):
             self._reset_tag_tracking_state()
@@ -576,6 +655,19 @@ class NaturalHandler(Node):
             self.pre_nat_search_orientation = None
             self.odom_seen_pub.publish(Bool(data=False))
             self._target_visible = False
+
+    def _get_nominal_tool_pos(
+        self,
+        cart_mins: np.ndarray,
+        cart_maxs: np.ndarray,
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        frac = np.clip(self.nominal_fractions, 0.0, 1.0)
+        nominal = cart_mins + frac * (cart_maxs - cart_mins)
+        if self.start_mode3_pos is not None:
+            start_clipped = np.clip(self.start_mode3_pos, cart_mins, cart_maxs)
+            nominal = 0.65 * nominal + 0.35 * start_clipped
+        span = np.maximum(cart_maxs - cart_mins, 1e-3)
+        return nominal, span
 
     def _reset_tag_tracking_state(self):
         self.tag_tgt_pos = None
@@ -1453,6 +1545,8 @@ class NaturalHandler(Node):
 
         if self.start_mode3_q is None:
             self.start_mode3_q = curr_q.copy()
+        if self.start_mode3_pos is None:
+            self.start_mode3_pos = curr_pos.copy()
 
         cart_mins, cart_maxs = self._select_workspace(curr_pos, tgt_pos)
         cam_target_z = self._compute_cam_target_z(curr_pos, curr_q, trans_tool_cam, tgt_pos)
@@ -1535,6 +1629,7 @@ class NaturalHandler(Node):
 
         predict_dt = self.vision_delay_sec + self.motor_delay_sec + max(stale_age, 0.0)
         x0 = np.zeros(6, dtype=float)
+        nominal_tool_pos, nominal_pos_span = self._get_nominal_tool_pos(cart_mins, cart_maxs)
 
         try:
             res = minimize(
@@ -1566,6 +1661,12 @@ class NaturalHandler(Node):
                     self.distance_objective_mode,
                     self.desired_dist,
                     self.desired_view_cos,
+                    self.delta_pos_max,
+                    self.delta_rot_max,
+                    nominal_tool_pos,
+                    nominal_pos_span,
+                    self.nominal_axis_weights,
+                    self.rotation_penalty_scale,
                 ),
                 options={"disp": False, "maxiter": self.maxiter, "ftol": 1e-4},
             )

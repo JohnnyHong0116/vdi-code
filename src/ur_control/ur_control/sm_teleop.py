@@ -5,7 +5,7 @@ from rclpy.node import Node
 
 import tf2_ros
 from geometry_msgs.msg import PoseStamped
-from std_msgs.msg import Bool
+from std_msgs.msg import Bool, Int32
 
 from scipy.spatial.transform import Rotation as R
 import pyspacemouse
@@ -20,6 +20,7 @@ class SMTeleop(Node):
         self.declare_parameter('tool_frame', 'tool0')
         self.declare_parameter('desired_pose_topic', '/ur7e/target_pose')
         self.declare_parameter('teleop_active_topic', '/ur7e/teleop_active')
+        self.declare_parameter('mode_topic', '/mode')
         self.declare_parameter('rate_hz', 10.0)
         self.declare_parameter('teleop_active_hold_s', 0.25)
 
@@ -30,6 +31,7 @@ class SMTeleop(Node):
         self.tool_frame = self.get_parameter('tool_frame').value
         self.desired_pose_topic = self.get_parameter('desired_pose_topic').value
         self.teleop_active_topic = self.get_parameter('teleop_active_topic').value
+        self.mode_topic = self.get_parameter('mode_topic').value
         self.rate_hz = float(self.get_parameter('rate_hz').value)
         self.w_lin = float(self.get_parameter('w_lin').value)
         self.w_ang = float(self.get_parameter('w_ang').value)
@@ -47,6 +49,7 @@ class SMTeleop(Node):
         # publishers
         self.pose_pub = self.create_publisher(PoseStamped, self.desired_pose_topic, 1)
         self.active_pub = self.create_publisher(Bool, self.teleop_active_topic, 1)
+        self.mode_sub = self.create_subscription(Int32, self.mode_topic, self.on_mode, 10)
 
         # SpaceMouse
         self.sm_device = None
@@ -75,16 +78,33 @@ class SMTeleop(Node):
         self.curr_pos = None
         self.curr_q = None
         self.last_active_ns = 0
+        self.mode = -1
 
         self.timer = self.create_timer(1.0 / self.rate_hz, self.tick)
         self.get_logger().info(f"sm_teleop publishing to {self.desired_pose_topic}")
         self.get_logger().info(f"sm_teleop active topic {self.teleop_active_topic}")
+        self.get_logger().info(f"sm_teleop mode topic {self.mode_topic}")
         self.get_logger().info(f"TF: {self.base_frame} -> {self.tool_frame}")
 
     def apply_deadband(self, val):
         if abs(val) < self.deadband:
             return 0.0
         return val
+
+    def on_mode(self, msg: Int32):
+        self.mode = int(msg.data)
+
+    def _publish_active(self, active: bool):
+        active_msg = Bool()
+        active_msg.data = bool(active)
+        self.active_pub.publish(active_msg)
+
+    def _sync_to_actual_pose(self, actual_pos, actual_q):
+        if actual_pos is None or actual_q is None:
+            return
+        self.curr_pos = actual_pos.copy()
+        self.curr_q = actual_q.copy()
+        self.got_robot_pose = True
 
     def tick(self):
         # 1) Get Actual Robot Pose (latest available)
@@ -115,6 +135,12 @@ class SMTeleop(Node):
                 self.get_logger().info("Initialized SpaceMouse teleop pose from TF.")
             else:
                 return  # Wait for TF
+
+        if self.mode in (3, 4):
+            self.last_active_ns = 0
+            self._publish_active(False)
+            self._sync_to_actual_pose(actual_pos, actual_q)
+            return
 
         # 2) Read SpaceMouse
         sm_state = None
@@ -157,9 +183,7 @@ class SMTeleop(Node):
         if self.active_hold_ns > 0 and self.last_active_ns > 0:
             active = active or ((now_ns - self.last_active_ns) <= self.active_hold_ns)
 
-        active_msg = Bool()
-        active_msg.data = bool(active)
-        self.active_pub.publish(active_msg)
+        self._publish_active(active)
 
         # 3) Update Poses
         if is_idle and actual_pos is not None:
