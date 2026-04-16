@@ -4,8 +4,10 @@ import rclpy
 from rclpy.node import Node
 
 import tf2_ros
-from geometry_msgs.msg import PoseStamped
+from geometry_msgs.msg import PoseStamped, PoseWithCovarianceStamped
+from nav_msgs.msg import Odometry
 from sensor_msgs.msg import JointState
+from std_msgs.msg import Int32
 
 import viser
 
@@ -29,12 +31,17 @@ class ViserViewer(Node):
         self.declare_parameter('tool_frame', 'tool0')
         self.declare_parameter('camera_frame', 'head_camera')
         self.declare_parameter('desired_pose_topic', '/ur7e/desired_pose')
+        self.declare_parameter('fused_pose_topic', '/ur7e/fused_tool_pose')
+        self.declare_parameter('fused_odom_topic', '/vo')
+        self.declare_parameter('mode_topic', '/mode')
         self.declare_parameter('rate_hz', 450.0)
         self.declare_parameter('viser_host', '0.0.0.0')
         self.declare_parameter('viser_port', 8080)
         self.declare_parameter('show_actual_pose', True)
         self.declare_parameter('show_desired_pose', True)
         self.declare_parameter('show_camera_pose', True)
+        self.declare_parameter('show_fused_pose', True)
+        self.declare_parameter('show_fused_display_pose', True)
         self.declare_parameter('grid_size', 2.0)
         self.declare_parameter('axes_length', 0.2)
         self.declare_parameter('axes_radius', 0.01)
@@ -52,12 +59,19 @@ class ViserViewer(Node):
         self.tool_frame = self.get_parameter('tool_frame').value
         self.camera_frame = self.get_parameter('camera_frame').value
         self.desired_pose_topic = self.get_parameter('desired_pose_topic').value
+        self.fused_pose_topic = self.get_parameter('fused_pose_topic').value
+        self.fused_odom_topic = self.get_parameter('fused_odom_topic').value
+        self.mode_topic = self.get_parameter('mode_topic').value
         self.rate_hz = float(self.get_parameter('rate_hz').value)
         self.viser_host = self.get_parameter('viser_host').value
         self.viser_port = int(self.get_parameter('viser_port').value)
         self.show_actual = bool(self.get_parameter('show_actual_pose').value)
         self.show_desired = bool(self.get_parameter('show_desired_pose').value)
         self.show_camera = bool(self.get_parameter('show_camera_pose').value)
+        self.show_fused = bool(self.get_parameter('show_fused_pose').value)
+        self.show_fused_display = bool(
+            self.get_parameter('show_fused_display_pose').value
+        )
         self.grid_size = float(self.get_parameter('grid_size').value)
         self.axes_length = float(self.get_parameter('axes_length').value)
         self.axes_radius = float(self.get_parameter('axes_radius').value)
@@ -146,9 +160,38 @@ class ViserViewer(Node):
                 origin_color=(255, 0, 0),
             )
 
+        self.fused_handle = None
+        if self.show_fused:
+            self.fused_handle = self.scene.add_frame(
+                'fused_raw',
+                show_axes=True,
+                axes_length=self.axes_length,
+                axes_radius=self.axes_radius,
+                origin_color=(255, 165, 0),
+            )
+            self.fused_handle.visible = False
+
+        self.fused_display_handle = None
+        if self.show_fused_display:
+            self.fused_display_handle = self.scene.add_frame(
+                'fused_display',
+                show_axes=True,
+                axes_length=self.axes_length,
+                axes_radius=self.axes_radius,
+                origin_color=(255, 0, 255),
+            )
+            self.fused_display_handle.visible = False
+
         self.des_pos = None
         self.des_q = None
+        self.fused_pos = None
+        self.fused_q = None
+        self.mode = -1
+        self.fused_display_fix_q = np.array([1.0, 0.0, 0.0, 0.0], dtype=float)
         self.desired_pose_sub = None
+        self.fused_pose_sub = None
+        self.fused_odom_sub = None
+        self.mode_sub = None
         self.joint_state_sub = None
 
         # TF
@@ -163,6 +206,25 @@ class ViserViewer(Node):
                 self.on_desired_pose,
                 1,
             )
+        if self.show_fused:
+            self.fused_pose_sub = self.create_subscription(
+                PoseWithCovarianceStamped,
+                self.fused_pose_topic,
+                self.on_fused_pose,
+                1,
+            )
+            self.fused_odom_sub = self.create_subscription(
+                Odometry,
+                self.fused_odom_topic,
+                self.on_fused_odom,
+                1,
+            )
+        self.mode_sub = self.create_subscription(
+            Int32,
+            self.mode_topic,
+            self.on_mode,
+            10,
+        )
 
         if self.viser_urdf is not None:
             self.joint_state_sub = self.create_subscription(
@@ -179,6 +241,11 @@ class ViserViewer(Node):
             f"(base={self.base_frame}, tool={self.tool_frame}, "
             f"camera={self.camera_frame}, "
             f"robot={self.robot_description})"
+        )
+        self.get_logger().info(
+            f"Viser topics: desired={self.desired_pose_topic}, "
+            f"fused_pose={self.fused_pose_topic}, "
+            f"fused_odom={self.fused_odom_topic}, mode={self.mode_topic}"
         )
 
     def _init_robot_model(self):
@@ -312,6 +379,27 @@ class ViserViewer(Node):
         quat_xyzw = self.quat_xyzw_normalize(quat_xyzw)
         handle.position = (float(pos[0]), float(pos[1]), float(pos[2]))
         handle.wxyz = self.quat_xyzw_to_wxyz(quat_xyzw)
+
+    def update_fused_handles(self):
+        fused_visible = (self.mode == 3 and self.fused_pos is not None and self.fused_q is not None)
+
+        if self.fused_handle is not None:
+            self.fused_handle.visible = fused_visible
+            if fused_visible:
+                self.update_handle(self.fused_handle, self.fused_pos, self.fused_q)
+
+        if self.fused_display_handle is not None:
+            self.fused_display_handle.visible = fused_visible
+            if fused_visible:
+                fused_display_q = self.quat_xyzw_multiply(
+                    self.fused_q,
+                    self.fused_display_fix_q,
+                )
+                self.update_handle(
+                    self.fused_display_handle,
+                    self.fused_pos,
+                    fused_display_q,
+                )
 
     def transform_pose_to_base(self, pos, quat_xyzw, source_frame):
         if not source_frame or source_frame == self.base_frame:
@@ -448,8 +536,64 @@ class ViserViewer(Node):
         if self.des_handle is not None:
             self.update_handle(self.des_handle, self.des_pos, self.des_q)
 
+    def on_fused_pose(self, msg: PoseWithCovarianceStamped):
+        pos = np.array(
+            [
+                msg.pose.pose.position.x,
+                msg.pose.pose.position.y,
+                msg.pose.pose.position.z,
+            ],
+            dtype=float,
+        )
+        quat = np.array(
+            [
+                msg.pose.pose.orientation.x,
+                msg.pose.pose.orientation.y,
+                msg.pose.pose.orientation.z,
+                msg.pose.pose.orientation.w,
+            ],
+            dtype=float,
+        )
+        source_frame = msg.header.frame_id.strip() if msg.header.frame_id else ''
+        transformed = self.transform_pose_to_base(pos, quat, source_frame)
+        if transformed is None:
+            return
+        self.fused_pos, self.fused_q = transformed
+        self.update_fused_handles()
+
+    def on_fused_odom(self, msg: Odometry):
+        pos = np.array(
+            [
+                msg.pose.pose.position.x,
+                msg.pose.pose.position.y,
+                msg.pose.pose.position.z,
+            ],
+            dtype=float,
+        )
+        quat = np.array(
+            [
+                msg.pose.pose.orientation.x,
+                msg.pose.pose.orientation.y,
+                msg.pose.pose.orientation.z,
+                msg.pose.pose.orientation.w,
+            ],
+            dtype=float,
+        )
+        source_frame = msg.header.frame_id.strip() if msg.header.frame_id else ''
+        transformed = self.transform_pose_to_base(pos, quat, source_frame)
+        if transformed is None:
+            return
+        self.fused_pos, self.fused_q = transformed
+        self.update_fused_handles()
+
+    def on_mode(self, msg: Int32):
+        self.mode = int(msg.data)
+        self.update_fused_handles()
+
     def tick(self):
         self.update_robot_alignment()
+
+        self.update_fused_handles()
 
         if self.tool_handle is None and self.camera_handle is None:
             return
