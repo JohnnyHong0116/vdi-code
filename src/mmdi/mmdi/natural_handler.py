@@ -18,6 +18,7 @@ from rclpy.time import Time
 
 from geometry_msgs.msg import PoseStamped, PoseWithCovarianceStamped, TwistStamped
 from nav_msgs.msg import Odometry
+from sensor_msgs.msg import CameraInfo
 from scipy.optimize import minimize
 from scipy.spatial.transform import Rotation as ScipyR
 from std_msgs.msg import Bool, Int32
@@ -36,6 +37,14 @@ def _stamp_to_sec(stamp) -> float:
 
 def _quat_from_msg(qmsg) -> np.ndarray:
     return np.array([qmsg.x, qmsg.y, qmsg.z, qmsg.w], dtype=float)
+
+
+def _safe_normalize(vec: np.ndarray, eps: float = 1e-9) -> Tuple[np.ndarray, bool]:
+    arr = np.asarray(vec, dtype=float)
+    norm = float(np.linalg.norm(arr))
+    if (not np.isfinite(norm)) or norm <= eps:
+        return np.zeros_like(arr), False
+    return arr / norm, True
 
 
 def _twist_is_informative(lin: np.ndarray, ang: np.ndarray, eps: float = 1e-6) -> bool:
@@ -117,6 +126,8 @@ def _camera_pose_residual(
     nominal_pos_span: np.ndarray,
     nominal_pos_axis_weights: np.ndarray,
     rotation_penalty_scale: float,
+    preferred_tool_view_axis: np.ndarray,
+    min_safe_view_cos: float,
 ) -> float:
     tool_pos = curr_pos + x[:3]
     tool_rotvec = curr_rotvec + x[3:6]
@@ -154,12 +165,14 @@ def _camera_pose_residual(
     w_view = 8.0 / (1.0 + 40.0 * unc)
     w_center = 90.0 / (1.0 + 40.0 * unc)
     w_vis = 40.0 * (1.0 + 20.0 * unc)
+    w_rear = 160.0 * (1.0 + 20.0 * unc)
     w_nominal = 10.0
     w_smooth = 2.5 * (1.0 + 40.0 * unc)
     w_step = 1.5 * (1.0 + 40.0 * unc)
 
     vec_ct = tgt_pos_d - cam_pos
     dist = np.linalg.norm(vec_ct) + 1e-9
+    view_dir, view_dir_ok = _safe_normalize(vec_ct)
     if distance_objective_mode == "camera_z":
         vec_ct_cam = ScipyR.from_quat(cam_q).inv().apply(vec_ct)
         track_dist = float(vec_ct_cam[2])
@@ -168,11 +181,17 @@ def _camera_pose_residual(
     loss_track = (track_dist - desired_dist) ** 2
 
     z_cam = ScipyR.from_quat(cam_q).as_matrix()[:, 2]
-    loss_align = (1.0 - float(np.dot(vec_ct / dist, z_cam))) ** 2
+    loss_align = (1.0 - float(np.dot(view_dir, z_cam))) ** 2 if view_dir_ok else 1e2
 
-    z_tgt = ScipyR.from_quat(tgt_q_d).as_matrix()[:, 2]
-    vec_tc = -vec_ct / dist
-    loss_view = (float(np.dot(vec_tc, z_tgt)) - desired_view_cos) ** 2
+    tool_view_axis = ScipyR.from_quat(tgt_q_d).apply(preferred_tool_view_axis)
+    tool_view_axis, tool_axis_ok = _safe_normalize(tool_view_axis)
+    if view_dir_ok and tool_axis_ok:
+        view_cos = float(np.dot(view_dir, tool_view_axis))
+        loss_view = (view_cos - desired_view_cos) ** 2
+        loss_rear_safety = float(_softplus((min_safe_view_cos - view_cos) / 0.05))
+    else:
+        loss_view = 1e2
+        loss_rear_safety = 1e3
 
     uv, valid = _project_target_points(
         cam_pos, cam_q, tgt_pos_d, tgt_q_d, tgt_points, fx, fy, cx, cy
@@ -235,6 +254,7 @@ def _camera_pose_residual(
         + w_view * loss_view
         + w_center * loss_center
         + w_vis * loss_vis
+        + w_rear * loss_rear_safety
         + w_nominal * loss_nominal
         + w_smooth * loss_smooth
         + w_step * loss_step
@@ -253,6 +273,7 @@ class NaturalHandler(Node):
         self.declare_parameter("fused_twist_topic", "/ur7e/fused_tool_twist")
         self.declare_parameter("fused_odom_topic", "/vo")
         self.declare_parameter("probe_markers_topic", "/probe_tracker/markers")
+        self.declare_parameter("camera_info_topic", "/probe_tracker/camera_info")
         self.declare_parameter("base_frame", "base")
         self.declare_parameter("tool_frame", "tool0")
         self.declare_parameter("camera_frame", "head_camera")
@@ -308,7 +329,9 @@ class NaturalHandler(Node):
         # View objective
         self.declare_parameter("distance_objective_mode", "camera_z")
         self.declare_parameter("desired_distance", 0.30)
-        self.declare_parameter("desired_view_cos", 0.7071)
+        self.declare_parameter("desired_view_cos", 0.85)
+        self.declare_parameter("preferred_tool_view_axis", [0.0, 1.0, 0.0])
+        self.declare_parameter("min_safe_view_cos", 0.15)
         self.declare_parameter("nominal_x_fraction", 0.12)
         self.declare_parameter("nominal_y_fraction", 0.50)
         self.declare_parameter("nominal_z_fraction", 0.15)
@@ -337,6 +360,7 @@ class NaturalHandler(Node):
         self.fused_twist_topic = str(self.get_parameter("fused_twist_topic").value)
         self.fused_odom_topic = str(self.get_parameter("fused_odom_topic").value)
         self.probe_markers_topic = str(self.get_parameter("probe_markers_topic").value)
+        self.camera_info_topic = str(self.get_parameter("camera_info_topic").value)
         self.base_frame = str(self.get_parameter("base_frame").value)
         self.tool_frame = str(self.get_parameter("tool_frame").value)
         self.camera_frame = str(self.get_parameter("camera_frame").value)
@@ -467,6 +491,21 @@ class NaturalHandler(Node):
 
         self.desired_dist = float(self.get_parameter("desired_distance").value)
         self.desired_view_cos = float(self.get_parameter("desired_view_cos").value)
+        preferred_view_axis = np.asarray(
+            self.get_parameter("preferred_tool_view_axis").value,
+            dtype=float,
+        ).reshape(-1)
+        if preferred_view_axis.size != 3:
+            preferred_view_axis = np.array([0.0, 1.0, 0.0], dtype=float)
+        preferred_view_axis, axis_ok = _safe_normalize(preferred_view_axis)
+        self.preferred_tool_view_axis = (
+            preferred_view_axis
+            if axis_ok
+            else np.array([0.0, 1.0, 0.0], dtype=float)
+        )
+        self.min_safe_view_cos = float(
+            self.get_parameter("min_safe_view_cos").value
+        )
         self.nominal_fractions = np.array(
             [
                 float(self.get_parameter("nominal_x_fraction").value),
@@ -561,6 +600,7 @@ class NaturalHandler(Node):
         self.create_subscription(TwistStamped, self.fused_twist_topic, self.on_fused_twist, 10)
         self.create_subscription(Odometry, self.fused_odom_topic, self.on_fused_odom, 10)
         self.create_subscription(MarkerArray, self.probe_markers_topic, self.on_probe_markers, 10)
+        self.create_subscription(CameraInfo, self.camera_info_topic, self.on_camera_info, 10)
 
         self.timer = self.create_timer(self.ctrl_dt, self.tick)
 
@@ -571,6 +611,7 @@ class NaturalHandler(Node):
             f"fused topics: pose={self.fused_pose_topic}, twist={self.fused_twist_topic}, odom={self.fused_odom_topic}"
         )
         self.get_logger().info(f"probe markers topic: {self.probe_markers_topic}")
+        self.get_logger().info(f"camera info topic: {self.camera_info_topic}")
         self.get_logger().info(
             f"priority tag tracking: {self.use_priority_tag_tracking}, preferred ids={self.tracking_tag_ids}"
         )
@@ -608,7 +649,10 @@ class NaturalHandler(Node):
             "optimizer bias: "
             f"mode={self.distance_objective_mode}, "
             f"nominal_frac={np.round(self.nominal_fractions, 2).tolist()}, "
-            f"rotation_penalty_scale={self.rotation_penalty_scale:.2f}"
+            f"rotation_penalty_scale={self.rotation_penalty_scale:.2f}, "
+            f"tool_view_axis={np.round(self.preferred_tool_view_axis, 2).tolist()}, "
+            f"desired_view_cos={self.desired_view_cos:.2f}, "
+            f"min_safe_view_cos={self.min_safe_view_cos:.2f}"
         )
         self.get_logger().info(f"workspace_side mode: {self.workspace_side}")
         self.get_logger().info(
@@ -683,6 +727,22 @@ class NaturalHandler(Node):
         self.last_priority_tag_points_sec = None
         self.last_fused_cam_z = None
         self.last_fused_cam_z_sec = None
+
+    def on_camera_info(self, msg: CameraInfo):
+        if msg.width > 0:
+            self.img_w = float(msg.width)
+        if msg.height > 0:
+            self.img_h = float(msg.height)
+        if len(msg.k) >= 9:
+            fx = float(msg.k[0])
+            fy = float(msg.k[4])
+            cx = float(msg.k[2])
+            cy = float(msg.k[5])
+            if all(np.isfinite(v) for v in (fx, fy, cx, cy)) and fx > 1e-6 and fy > 1e-6:
+                self.fx = fx
+                self.fy = fy
+                self.cx = cx
+                self.cy = cy
 
     def _publish_target_visible(self, visible: bool):
         visible = bool(visible)
@@ -1080,7 +1140,29 @@ class NaturalHandler(Node):
                 orbit_wps.append(tool_pos)
 
             if orbit_wps:
-                orbit_wps.sort(key=lambda wp: float(np.linalg.norm(wp - curr_pos)))
+                tgt_q_hint = self.tgt_q if self.tgt_q is not None else self.tag_tgt_q
+                preferred_axis_base = None
+                if tgt_q_hint is not None:
+                    preferred_axis_base = ScipyR.from_quat(tgt_q_hint).apply(
+                        self.preferred_tool_view_axis
+                    )
+                    preferred_axis_base, ok = _safe_normalize(preferred_axis_base)
+                    if not ok:
+                        preferred_axis_base = None
+
+                def orbit_sort_key(wp):
+                    wp_dist = float(np.linalg.norm(wp - curr_pos))
+                    if preferred_axis_base is None:
+                        return (wp_dist,)
+                    cam_pos = wp + cam_offset_base
+                    cam_view = self.tag_tgt_pos - cam_pos
+                    cam_off_dir, ok = _safe_normalize(cam_view)
+                    if not ok:
+                        return (1.0, wp_dist)
+                    view_score = float(np.dot(cam_off_dir, preferred_axis_base))
+                    return (-view_score, wp_dist)
+
+                orbit_wps.sort(key=orbit_sort_key)
                 waypoints.extend(orbit_wps)
                 orbit_added = True
 
@@ -1667,6 +1749,8 @@ class NaturalHandler(Node):
                     nominal_pos_span,
                     self.nominal_axis_weights,
                     self.rotation_penalty_scale,
+                    self.preferred_tool_view_axis,
+                    self.min_safe_view_cos,
                 ),
                 options={"disp": False, "maxiter": self.maxiter, "ftol": 1e-4},
             )

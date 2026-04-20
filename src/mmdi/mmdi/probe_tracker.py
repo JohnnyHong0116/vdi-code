@@ -267,6 +267,20 @@ def tag_quality_ok(area_px, reproj_err_px, min_area_px, max_reproj_err_px):
     return True
 
 
+def measurement_confidence(tag_count, primary_tag_visible):
+    if tag_count >= 3:
+        conf = 1.0
+    elif tag_count == 2:
+        conf = 0.78
+    elif tag_count == 1:
+        conf = 0.42
+    else:
+        conf = 0.0
+    if primary_tag_visible and tag_count > 0:
+        conf += 0.10
+    return float(np.clip(conf, 0.0, 1.0))
+
+
 # ===========================================================================
 # ROS 2 node
 # ===========================================================================
@@ -279,21 +293,30 @@ class ProbeTracker(Node):
         self.declare_parameter('marker_mm', float(MARKER_MM))
         self.declare_parameter('camera_width', 848)
         self.declare_parameter('camera_height', 480)
-        self.declare_parameter('camera_fps', 90)
-        self.declare_parameter('use_infrared', True)
+        self.declare_parameter('camera_fps', 30)
+        self.declare_parameter('use_infrared', False)
         self.declare_parameter('infrared_index', 1)
         self.declare_parameter('exposure', 8000.0)
         self.declare_parameter('gain', 16.0)
+        self.declare_parameter('color_auto_exposure', True)
+        self.declare_parameter('color_auto_white_balance', True)
         self.declare_parameter('show_gui', True)
         self.declare_parameter('n_particles', 3000)
         self.declare_parameter('process_noise', 0.002)
         self.declare_parameter('meas_noise', 0.015)
         self.declare_parameter('velocity_noise', 0.016)
         self.declare_parameter('velocity_decay', 0.96)
+        self.declare_parameter('pf_resample_thresh_ratio', 0.5)
+        self.declare_parameter('pf_injection_rate', 0.05)
+        self.declare_parameter('pf_injection_trigger_m', 0.015)
+        self.declare_parameter('pf_injection_ramp_m', 0.025)
         self.declare_parameter('rot_jump_deg', 140.0)
         self.declare_parameter('max_jump_m', 0.30)
         self.declare_parameter('pos_consensus_thresh_m', 0.05)
         self.declare_parameter('rot_consensus_thresh_deg', 14.0)
+        self.declare_parameter('single_tag_jump_scale', 0.45)
+        self.declare_parameter('single_tag_rot_jump_scale', 0.55)
+        self.declare_parameter('single_tag_alpha_scale', 0.45)
         self.declare_parameter('min_tag_area_px', 0.0)
         self.declare_parameter('max_reproj_error_px', 15.0)
         self.declare_parameter('use_clahe_detection', True)
@@ -318,12 +341,24 @@ class ProbeTracker(Node):
         self.infrared_index = self.get_parameter('infrared_index').value
         self.exposure = self.get_parameter('exposure').value
         self.gain = self.get_parameter('gain').value
+        self.color_auto_exposure = self.get_parameter('color_auto_exposure').value
+        self.color_auto_white_balance = (
+            self.get_parameter('color_auto_white_balance').value
+        )
         self.show_gui = self.get_parameter('show_gui').value
         n_particles = self.get_parameter('n_particles').value
         proc_noise = self.get_parameter('process_noise').value
         meas_noise = self.get_parameter('meas_noise').value
         velocity_noise = self.get_parameter('velocity_noise').value
         velocity_decay = self.get_parameter('velocity_decay').value
+        pf_resample_thresh_ratio = (
+            self.get_parameter('pf_resample_thresh_ratio').value
+        )
+        pf_injection_rate = self.get_parameter('pf_injection_rate').value
+        pf_injection_trigger_m = (
+            self.get_parameter('pf_injection_trigger_m').value
+        )
+        pf_injection_ramp_m = self.get_parameter('pf_injection_ramp_m').value
         self.rot_jump_deg = self.get_parameter('rot_jump_deg').value
         self.max_jump_m = self.get_parameter('max_jump_m').value
         self.pos_consensus_thresh_m = (
@@ -331,6 +366,15 @@ class ProbeTracker(Node):
         )
         self.rot_consensus_thresh_deg = (
             self.get_parameter('rot_consensus_thresh_deg').value
+        )
+        self.single_tag_jump_scale = (
+            self.get_parameter('single_tag_jump_scale').value
+        )
+        self.single_tag_rot_jump_scale = (
+            self.get_parameter('single_tag_rot_jump_scale').value
+        )
+        self.single_tag_alpha_scale = (
+            self.get_parameter('single_tag_alpha_scale').value
         )
         self.min_tag_area_px = self.get_parameter('min_tag_area_px').value
         self.max_reproj_error_px = self.get_parameter('max_reproj_error_px').value
@@ -384,6 +428,10 @@ class ProbeTracker(Node):
             meas_noise_std=meas_noise,
             velocity_noise_std=velocity_noise,
             velocity_decay=velocity_decay,
+            resample_thresh_ratio=pf_resample_thresh_ratio,
+            injection_rate=pf_injection_rate,
+            injection_trigger_m=pf_injection_trigger_m,
+            injection_ramp_m=pf_injection_ramp_m,
         )
         self.prev_estimate = None
         self.prev_rot = None
@@ -454,12 +502,10 @@ class ProbeTracker(Node):
     # -----------------------------------------------------------------------
     # RealSense capture (blocking, runs in dedicated thread)
     # -----------------------------------------------------------------------
-    def _capture_loop(self):
-        try:
-            pipe = rs.pipeline()
-            cfg = rs.config()
-            if self.use_infrared:
-                cfg.enable_stream(
+    def _stream_attempts(self):
+        if self.use_infrared:
+            return [
+                (
                     rs.stream.infrared,
                     self.infrared_index,
                     self.cam_w,
@@ -467,27 +513,87 @@ class ProbeTracker(Node):
                     rs.format.y8,
                     self.cam_fps,
                 )
-            else:
-                cfg.enable_stream(
-                    rs.stream.color, self.cam_w, self.cam_h,
-                    rs.format.bgr8, self.cam_fps)
-            profile = pipe.start(cfg)
+            ]
+        attempts = [
+            (rs.stream.color, None, self.cam_w, self.cam_h, rs.format.bgr8, self.cam_fps),
+            (rs.stream.color, None, 848, 480, rs.format.bgr8, min(int(self.cam_fps), 30)),
+            (rs.stream.color, None, 640, 480, rs.format.bgr8, min(int(self.cam_fps), 30)),
+        ]
+        deduped = []
+        seen = set()
+        for attempt in attempts:
+            key = (attempt[2], attempt[3], attempt[5])
+            if key in seen:
+                continue
+            seen.add(key)
+            deduped.append(attempt)
+        return deduped
+
+    def _capture_loop(self):
+        try:
+            pipe = None
+            profile = None
+            active_attempt = None
+            last_error = None
+            for attempt in self._stream_attempts():
+                pipe = rs.pipeline()
+                cfg = rs.config()
+                stream_type, stream_index, width, height, fmt, fps = attempt
+                if stream_index is None:
+                    cfg.enable_stream(stream_type, width, height, fmt, fps)
+                else:
+                    cfg.enable_stream(
+                        stream_type, stream_index, width, height, fmt, fps
+                    )
+                try:
+                    profile = pipe.start(cfg)
+                    active_attempt = attempt
+                    break
+                except Exception as exc:
+                    last_error = exc
+                    try:
+                        pipe.stop()
+                    except Exception:
+                        pass
+                    pipe = None
+            if profile is None or pipe is None or active_attempt is None:
+                raise RuntimeError(f'no supported RealSense profile: {last_error}')
+
+            _, _, req_w, req_h, _, req_fps = active_attempt
+            self.cam_w = int(req_w)
+            self.cam_h = int(req_h)
+            self.cam_fps = int(req_fps)
 
             # Manual exposure
             if self.use_infrared:
                 sensor = profile.get_device().first_depth_sensor()
                 if sensor.supports(rs.option.emitter_enabled):
                     sensor.set_option(rs.option.emitter_enabled, 0)
+                if sensor.supports(rs.option.enable_auto_exposure):
+                    sensor.set_option(rs.option.enable_auto_exposure, 0)
+                if sensor.supports(rs.option.exposure):
+                    sensor.set_option(rs.option.exposure, self.exposure)
+                if sensor.supports(rs.option.gain):
+                    sensor.set_option(rs.option.gain, self.gain)
             else:
                 sensor = profile.get_device().first_color_sensor()
             if sensor.supports(rs.option.frames_queue_size):
                 sensor.set_option(rs.option.frames_queue_size, 1)
-            if sensor.supports(rs.option.enable_auto_exposure):
-                sensor.set_option(rs.option.enable_auto_exposure, 0)
-            if sensor.supports(rs.option.exposure):
-                sensor.set_option(rs.option.exposure, self.exposure)
-            if sensor.supports(rs.option.gain):
-                sensor.set_option(rs.option.gain, self.gain)
+            if not self.use_infrared:
+                if sensor.supports(rs.option.enable_auto_exposure):
+                    sensor.set_option(
+                        rs.option.enable_auto_exposure,
+                        1 if self.color_auto_exposure else 0,
+                    )
+                if sensor.supports(rs.option.enable_auto_white_balance):
+                    sensor.set_option(
+                        rs.option.enable_auto_white_balance,
+                        1 if self.color_auto_white_balance else 0,
+                    )
+                if (not self.color_auto_exposure) and sensor.supports(rs.option.exposure):
+                    sensor.set_option(rs.option.exposure, self.exposure)
+                if (not self.color_auto_exposure) and sensor.supports(rs.option.gain):
+                    sensor.set_option(rs.option.gain, self.gain)
 
             # Read intrinsics
             if self.use_infrared:
@@ -502,6 +608,8 @@ class ProbeTracker(Node):
                     .as_video_stream_profile()
                     .get_intrinsics()
                 )
+            self.cam_w = int(intrinsics.width)
+            self.cam_h = int(intrinsics.height)
             self.camera_matrix = np.array([
                 [intrinsics.fx, 0.0, intrinsics.ppx],
                 [0.0, intrinsics.fy, intrinsics.ppy],
@@ -650,7 +758,9 @@ class ProbeTracker(Node):
                 tag_probe_rotations.append(R_c_probe)
                 priority_gain = 2.0 if tag_id == PRIMARY_TAG_ID else 1.0
                 tag_measurement_weights.append(
-                    priority_gain * max(area_px, 1.0) / max(reproj_err_px, 0.5)
+                    priority_gain
+                    * np.sqrt(max(area_px, 1.0))
+                    / max(reproj_err_px, 0.75)
                 )
 
         # Gate and filter
@@ -666,6 +776,8 @@ class ProbeTracker(Node):
                 rot_jump_deg=self.rot_jump_deg,
                 rot_thresh_deg=self.rot_consensus_thresh_deg,
                 weights=tag_measurement_weights,
+                single_tag_jump_scale=self.single_tag_jump_scale,
+                single_tag_rot_jump_scale=self.single_tag_rot_jump_scale,
             )
 
             if meas_positions.shape[0] > 0:
@@ -683,6 +795,11 @@ class ProbeTracker(Node):
                 if raw_rot is not None:
                     raw_rot = stabilize_rotation_to_reference(
                         raw_rot, self.prev_rot)
+                clean_count = int(meas_positions.shape[0])
+                meas_conf = measurement_confidence(
+                    clean_count,
+                    primary_tag_visible,
+                )
 
                 if raw_pos is not None:
                     pos_delta = 0.0 if self.filtered_pos is None else np.linalg.norm(
@@ -694,8 +811,14 @@ class ProbeTracker(Node):
                         self.max_pos_alpha,
                         self.position_response_m,
                     )
-                    if primary_tag_visible:
+                    pos_alpha *= meas_conf
+                    if clean_count == 1:
+                        pos_alpha *= self.single_tag_alpha_scale
+                    if primary_tag_visible and clean_count > 1:
                         pos_alpha = max(pos_alpha, 0.80)
+                    elif primary_tag_visible and clean_count == 1:
+                        pos_alpha = max(pos_alpha, 0.35)
+                    pos_alpha = float(np.clip(pos_alpha, 0.05, self.max_pos_alpha))
                     fused_pos = blend_positions(self.filtered_pos, raw_pos, pos_alpha)
                     self.filtered_pos = fused_pos
                     self.prev_estimate = fused_pos
@@ -709,8 +832,14 @@ class ProbeTracker(Node):
                         self.max_rot_alpha,
                         self.rotation_response_deg,
                     )
-                    if primary_tag_visible:
+                    rot_alpha *= meas_conf
+                    if clean_count == 1:
+                        rot_alpha *= self.single_tag_alpha_scale
+                    if primary_tag_visible and clean_count > 1:
                         rot_alpha = max(rot_alpha, 0.95)
+                    elif primary_tag_visible and clean_count == 1:
+                        rot_alpha = max(rot_alpha, 0.45)
+                    rot_alpha = float(np.clip(rot_alpha, 0.05, self.max_rot_alpha))
                     fused_rot = blend_rotations(self.filtered_rot, raw_rot, rot_alpha)
                     fused_rot = stabilize_rotation_to_reference(
                         fused_rot, self.filtered_rot

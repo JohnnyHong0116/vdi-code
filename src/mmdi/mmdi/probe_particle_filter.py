@@ -138,7 +138,9 @@ DEFAULT_ROT_JUMP_DEG = 80.0
 def gate_and_filter_glitches(positions, rotations, prev_estimate, prev_rot,
                              max_jump=0.15, pos_thresh=0.03,
                              rot_jump_deg=DEFAULT_ROT_JUMP_DEG,
-                             rot_thresh_deg=10.0, weights=None):
+                             rot_thresh_deg=10.0, weights=None,
+                             single_tag_jump_scale=0.45,
+                             single_tag_rot_jump_scale=0.55):
     """Reject outlier observations within a single frame.
 
     Parameters
@@ -177,7 +179,15 @@ def gate_and_filter_glitches(positions, rotations, prev_estimate, prev_rot,
         idx = sane_indices[0]
         p = positions[idx]
         if prev_estimate is not None:
-            if np.linalg.norm(p - prev_estimate) > max_jump:
+            single_tag_jump = max(1e-6, float(max_jump) * float(single_tag_jump_scale))
+            if np.linalg.norm(p - prev_estimate) > single_tag_jump:
+                return np.zeros((0, 3)), [], np.zeros((0,), dtype=np.float64)
+        if prev_rot is not None:
+            single_tag_rot_jump = max(
+                1e-3,
+                float(rot_jump_deg) * float(single_tag_rot_jump_scale),
+            )
+            if get_angular_distance(rotations[idx], prev_rot) > single_tag_rot_jump:
                 return np.zeros((0, 3)), [], np.zeros((0,), dtype=np.float64)
         # A single visible tag after a fast wrist rotation is still better than
         # freezing the state on an outdated orientation.
@@ -237,7 +247,9 @@ class ProbeParticleFilter:
 
     def __init__(self, n_particles=3000, process_noise_std=0.002,
                  meas_noise_std=0.015, init_spread=0.02,
-                 velocity_noise_std=None, velocity_decay=0.92):
+                 velocity_noise_std=None, velocity_decay=0.92,
+                 resample_thresh_ratio=0.5, injection_rate=0.05,
+                 injection_trigger_m=0.015, injection_ramp_m=0.025):
         self.n = n_particles
         self.process_noise_std = process_noise_std
         self.meas_noise_std = meas_noise_std
@@ -248,10 +260,15 @@ class ProbeParticleFilter:
             else max(0.001, process_noise_std * 6.0)
         )
         self.velocity_decay = float(np.clip(velocity_decay, 0.0, 1.0))
+        self.resample_thresh = float(np.clip(resample_thresh_ratio, 0.05, 1.0)) * self.n
+        self.base_injection_rate = float(np.clip(injection_rate, 0.0, 0.5))
+        self.injection_trigger_m = float(max(0.0, injection_trigger_m))
+        self.injection_ramp_m = float(max(1e-6, injection_ramp_m))
         self.particles = None   # (n, 3)
         self.velocities = None  # (n, 3)
         self.weights = np.ones(n_particles) / n_particles
         self.initialized = False
+        self.last_estimate = None
 
     def init_from_measurements(self, positions, initial_velocity=None):
         """Scatter particles around the mean of the given positions (N,3)."""
@@ -265,6 +282,7 @@ class ProbeParticleFilter:
         )
         self.weights = np.ones(self.n) / self.n
         self.initialized = True
+        self.last_estimate = mean_pos.copy()
 
     def predict(self, dt):
         if not self.initialized:
@@ -290,7 +308,27 @@ class ProbeParticleFilter:
         measurement_weights = np.asarray(measurement_weights, dtype=np.float64)
         measurement_weights = np.clip(measurement_weights, 1e-9, None)
         measurement_weights /= measurement_weights.sum()
-        log_w = np.zeros(self.n)
+        meas_mean = np.average(positions, axis=0, weights=measurement_weights)
+        lag_dist = 0.0
+        if self.last_estimate is not None:
+            lag_dist = float(
+                np.linalg.norm(
+                    np.asarray(meas_mean, dtype=np.float64)
+                    - np.asarray(self.last_estimate, dtype=np.float64)
+                )
+            )
+        current_injection = self.base_injection_rate
+        if lag_dist > self.injection_trigger_m:
+            factor = np.clip(
+                (lag_dist - self.injection_trigger_m) / self.injection_ramp_m,
+                0.0,
+                1.0,
+            )
+            current_injection = self.base_injection_rate + (
+                (0.5 - self.base_injection_rate) * factor
+            )
+
+        log_w = np.log(np.clip(self.weights, 1e-300, None))
         for pos, meas_weight in zip(positions, measurement_weights):
             diff = self.particles - pos
             dist_sq = np.sum(diff ** 2, axis=1)
@@ -300,23 +338,46 @@ class ProbeParticleFilter:
         log_w -= log_w.max()
         self.weights = np.exp(log_w)
         self.weights /= self.weights.sum() + 1e-300
-        # Systematic resampling
-        ess = 1.0 / np.sum(self.weights ** 2)
-        if ess < self.n * 0.5:
-            cumsum = np.cumsum(self.weights)
-            cumsum[-1] = 1.0
-            u0 = np.random.random() / self.n
-            u = u0 + np.arange(self.n) / self.n
-            indices = np.searchsorted(cumsum, u)
-            self.particles = self.particles[indices]
-            self.velocities = self.velocities[indices]
-            self.weights = np.ones(self.n) / self.n
+        if current_injection > 1e-6:
+            self._inject_measurement_particles(meas_mean, current_injection)
+        ess = 1.0 / np.sum(np.clip(self.weights, 1e-300, None) ** 2)
+        if ess < self.resample_thresh:
+            self._systematic_resample()
+
+    def _inject_measurement_particles(self, meas_mean, injection_rate):
+        n_inject = int(self.n * float(np.clip(injection_rate, 0.0, 0.5)))
+        if n_inject <= 0:
+            return
+        worst_idxs = np.argsort(self.weights)[:n_inject]
+        mean_velocity = np.zeros(3, dtype=np.float64)
+        if self.velocities is not None:
+            mean_velocity = np.average(self.velocities, axis=0, weights=self.weights)
+        self.particles[worst_idxs] = np.asarray(meas_mean, dtype=np.float64) + (
+            np.random.randn(n_inject, 3) * self.meas_noise_std
+        )
+        self.velocities[worst_idxs] = mean_velocity + (
+            np.random.randn(n_inject, 3) * self.velocity_noise_std * 0.25
+        )
+        self.weights[worst_idxs] = 1.0 / self.n
+        self.weights /= self.weights.sum() + 1e-300
+
+    def _systematic_resample(self):
+        cumsum = np.cumsum(self.weights)
+        cumsum[-1] = 1.0
+        u0 = np.random.random() / self.n
+        u = u0 + np.arange(self.n) / self.n
+        indices = np.searchsorted(cumsum, u)
+        self.particles = self.particles[indices]
+        self.velocities = self.velocities[indices]
+        self.weights = np.ones(self.n) / self.n
 
     def estimate_position(self):
         """Return weighted mean position (3,) or None."""
         if not self.initialized:
             return None
-        return np.average(self.particles, axis=0, weights=self.weights)
+        est = np.average(self.particles, axis=0, weights=self.weights)
+        self.last_estimate = est.copy()
+        return est
 
     def estimate_velocity(self):
         """Return weighted mean velocity (3,) or None."""
