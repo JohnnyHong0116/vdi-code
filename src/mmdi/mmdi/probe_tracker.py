@@ -319,6 +319,9 @@ class ProbeTracker(Node):
         self.declare_parameter('single_tag_alpha_scale', 0.45)
         self.declare_parameter('min_tag_area_px', 0.0)
         self.declare_parameter('max_reproj_error_px', 15.0)
+        self.declare_parameter('min_tag_confirm_frames', 2)
+        self.declare_parameter('max_tag_confirm_gap_frames', 2)
+        self.declare_parameter('single_tag_max_jump_m', 0.12)
         self.declare_parameter('use_clahe_detection', True)
         self.declare_parameter('use_aruco3_detection', False)
         self.declare_parameter('hold_last_pose_s', 0.06)
@@ -378,6 +381,15 @@ class ProbeTracker(Node):
         )
         self.min_tag_area_px = self.get_parameter('min_tag_area_px').value
         self.max_reproj_error_px = self.get_parameter('max_reproj_error_px').value
+        self.min_tag_confirm_frames = int(
+            self.get_parameter('min_tag_confirm_frames').value
+        )
+        self.max_tag_confirm_gap_frames = int(
+            self.get_parameter('max_tag_confirm_gap_frames').value
+        )
+        self.single_tag_max_jump_m = float(
+            self.get_parameter('single_tag_max_jump_m').value
+        )
         self.use_clahe_detection = (
             self.get_parameter('use_clahe_detection').value
         )
@@ -443,6 +455,9 @@ class ProbeTracker(Node):
         self.last_fused_publish_sec = None
         self.last_fused_publish_pos = None
         self.last_fused_publish_rot = None
+        self.frame_index = 0
+        self.tag_confirm_count = {}
+        self.tag_last_seen_frame = {}
 
         # ---- ArUco detector (OpenCV 4.6 legacy API) -------------------------
         self.aruco_dict = cv2.aruco.Dictionary_get(cv2.aruco.DICT_4X4_50)
@@ -497,6 +512,12 @@ class ProbeTracker(Node):
         self.get_logger().info(
             f'ProbeTracker started: {self.cam_w}x{self.cam_h}@{self.cam_fps}fps, '
             f'{n_particles} particles, marker={self.marker_m*1000:.0f}mm'
+        )
+        self.get_logger().info(
+            'Fusion gating: '
+            f'confirm_frames={self.min_tag_confirm_frames}, '
+            f'confirm_gap={self.max_tag_confirm_gap_frames}, '
+            f'single_tag_max_jump={self.single_tag_max_jump_m:.3f}m'
         )
 
     # -----------------------------------------------------------------------
@@ -663,6 +684,7 @@ class ProbeTracker(Node):
     def _process_frame(self):
         now_time = self.get_clock().now()
         now_sec = now_time.nanoseconds * 1e-9
+        self.frame_index += 1
         if self.last_process_time is None:
             dt = 1.0 / max(float(self.cam_fps), 1.0)
         else:
@@ -693,6 +715,7 @@ class ProbeTracker(Node):
         tag_probe_positions = []
         tag_probe_rotations = []
         tag_measurement_weights = []
+        fusion_tag_ids = []
         detected_tag_poses = []
         primary_tag_visible = False
 
@@ -734,9 +757,23 @@ class ProbeTracker(Node):
                     t_c_probe = None
                 if t_c_probe is not None and t_c_probe[2] <= 0.0:
                     continue
+                tag_confirmed = False
+                if tag_id in self.known_ids and tag_id not in self.ignore_ids:
+                    prev_seen = self.tag_last_seen_frame.get(tag_id)
+                    if (
+                        prev_seen is not None
+                        and (self.frame_index - prev_seen) <= self.max_tag_confirm_gap_frames
+                    ):
+                        confirm_count = self.tag_confirm_count.get(tag_id, 0) + 1
+                    else:
+                        confirm_count = 1
+                    self.tag_confirm_count[tag_id] = confirm_count
+                    self.tag_last_seen_frame[tag_id] = self.frame_index
+                    tag_confirmed = confirm_count >= max(1, self.min_tag_confirm_frames)
                 used_for_fusion = (
                     tag_id not in self.ignore_ids
                     and tag_id in self.known_ids
+                    and tag_confirmed
                     and tag_quality_ok(
                         area_px,
                         reproj_err_px,
@@ -756,6 +793,7 @@ class ProbeTracker(Node):
 
                 tag_probe_positions.append(t_c_probe)
                 tag_probe_rotations.append(R_c_probe)
+                fusion_tag_ids.append(tag_id)
                 priority_gain = 2.0 if tag_id == PRIMARY_TAG_ID else 1.0
                 tag_measurement_weights.append(
                     priority_gain
@@ -771,7 +809,11 @@ class ProbeTracker(Node):
             meas_positions, clean_rotations, clean_weights = gate_and_filter_glitches(
                 tag_probe_positions, tag_probe_rotations,
                 self.prev_estimate, self.prev_rot,
-                max_jump=self.max_jump_m,
+                max_jump=(
+                    self.single_tag_max_jump_m
+                    if len(fusion_tag_ids) == 1
+                    else self.max_jump_m
+                ),
                 pos_thresh=self.pos_consensus_thresh_m,
                 rot_jump_deg=self.rot_jump_deg,
                 rot_thresh_deg=self.rot_consensus_thresh_deg,

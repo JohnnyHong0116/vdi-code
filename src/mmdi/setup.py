@@ -28,6 +28,7 @@ setup(
             'probe_tracker = mmdi.probe_tracker:main',
             'bbox_runner = mmdi.bbox_runner:main',
             'simple_tag_follower = mmdi.simple_tag_follower:main',
+	    'wrench_env_sensor = mmdi.wrench_env_sensor:main',
         ],
     },
 )
