@@ -136,7 +136,7 @@ class SMTeleop(Node):
             else:
                 return  # Wait for TF
 
-        if self.mode in (3, 4):
+        if self.mode == 3:
             self.last_active_ns = 0
             self._publish_active(False)
             self._sync_to_actual_pose(actual_pos, actual_q)

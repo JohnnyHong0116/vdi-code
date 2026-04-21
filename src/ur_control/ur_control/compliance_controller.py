@@ -143,7 +143,7 @@ class ComplianceController(Node):
         self.get_logger().info(f"Disable compliance in mode 2: {self.disable_compliance_in_mode2}")
 
     def _natural_mode_active(self) -> bool:
-        return self.mode in (3, 4)
+        return self.mode == 3
 
     # ------------------------------------------------------------------ #
     # Callbacks

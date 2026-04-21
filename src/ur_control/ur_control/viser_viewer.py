@@ -381,7 +381,11 @@ class ViserViewer(Node):
         handle.wxyz = self.quat_xyzw_to_wxyz(quat_xyzw)
 
     def update_fused_handles(self):
-        fused_visible = (self.mode == 3 and self.fused_pos is not None and self.fused_q is not None)
+        fused_visible = (
+            self.mode == 3
+            and self.fused_pos is not None
+            and self.fused_q is not None
+        )
 
         if self.fused_handle is not None:
             self.fused_handle.visible = fused_visible

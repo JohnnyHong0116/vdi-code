@@ -56,11 +56,11 @@ def generate_launch_description():
         # Static transform: hande_link_tool -> head_camera
         # Measured camera mount:
         #   camera center in tool0 frame:
-        #     x=+99.47 mm, y=+19.59 mm, z=+78.76 mm
+        #     x=+99.47 mm, y=+31.80 mm, z=+78.76 mm
         #   hande_link_tool axes map into tool0 as:
         #     +X_hande -> +Y_tool0, +Y_hande -> +X_tool0, +Z_hande -> -Z_tool0
         #   so the translation in hande_link_tool is:
-        #     x=+0.01959 m, y=+0.09947 m, z=-0.07876 m
+        #     x=+0.03180 m, y=+0.09947 m, z=-0.07876 m
         #   camera axes in tool0 should be:
         #     x_cam = -y_tool0
         #   then rotate +30 deg about the current camera x-axis:
@@ -73,7 +73,7 @@ def generate_launch_description():
             executable='static_transform_publisher',
             name='camera_frame_converter',
             arguments=[
-                '--x', '0.01959',
+                '--x', '0.03180',
                 '--y', '0.09947',
                 '--z', '-0.07876',
                 '--qx', '0.0',

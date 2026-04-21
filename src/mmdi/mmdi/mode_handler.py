@@ -1,17 +1,13 @@
 #!/usr/bin/env python3
 
-"""Mode (state machine) handling and LED publishing
-Converted to ROS 2 from ROS 1
-Original Author: Mike Hagenow
-Last Updated: 6/11/2024
+"""Mode state machine and LED publisher.
 
 MODE DESCRIPTION:
 -1: initialization
  0: idle (red)
  1: teleop (green)
  2: kinesthetic (yellow)
- 3: natural (blue)
- 4: pre_natural (blue)
+ 3: natural demonstration (blue)
 """
 
 import numpy as np
@@ -24,6 +20,12 @@ import time
 
 from tf2_ros import Buffer, TransformListener
 from rclpy.time import Time
+
+MODE_INIT = -1
+MODE_IDLE = 0
+MODE_TELEOP = 1
+MODE_KINESTHETIC = 2
+MODE_NATURAL = 3
 
 
 class ModeHandler(Node):
@@ -84,11 +86,11 @@ class ModeHandler(Node):
         self.tool_contact = 1
         self.curr_sm = False
         self.external_force = self.external_force_default
-        self.odom_seen = False
         self.tool_force_z = 0.0
         self.kinesthetic_armed = True
         self.last_wrench = None
         self.last_no_contact = None
+        self.last_contact = None
         self.wrench_bias_z = 0.0
         self.wrench_tare_accum_z = 0.0
         self.wrench_tare_count = 0
@@ -106,8 +108,6 @@ class ModeHandler(Node):
             Int32, '/tool_contact', self.store_tool_contact, 10)
         self.sm_sub = self.create_subscription(
             Bool, self.spacemouse_input_topic, self.store_curr_sm, 10)
-        self.odom_sub = self.create_subscription(
-            Bool, '/distance_odom_seen', self.store_odom_seen, 10)
         self.uniforce_sub = self.create_subscription(
             Float32, self.external_force_topic, self.store_uni_force, 10)
         self.wrench_sub = self.create_subscription(
@@ -120,14 +120,15 @@ class ModeHandler(Node):
         self.tf_buffer = Buffer()
         self.tf_listener = TransformListener(self.tf_buffer, self)
 
-        # Timing
-        self.start_mode_zero = time.time()
-        self.start_mode_four = None
-
         # Mode state
-        self.mode = -1  # Start with initialization
+        self.mode = MODE_INIT
         self.target_mode = None  # For handling direct mode commands
-        self.mode_colors = {0: 'r', 1: 'g', 2: 'y', 3: 'b', 4: 'b'}
+        self.mode_colors = {
+            MODE_IDLE: 'r',
+            MODE_TELEOP: 'g',
+            MODE_KINESTHETIC: 'y',
+            MODE_NATURAL: 'b',
+        }
 
         self.get_logger().info('ModeHandler initialized, waiting for startup...')
         self.get_logger().info(f'SpaceMouse input topic: {self.spacemouse_input_topic}')
@@ -204,15 +205,17 @@ class ModeHandler(Node):
     def store_tool_contact(self, msg):
         self.tool_contact = msg.data
 
-    def store_odom_seen(self, msg):
-        self.odom_seen = msg.data
-
     def handle_mode_cmd(self, msg):
         """Handle direct mode command - request mode change via tick loop"""
         cmd_mode = msg.data
-        if cmd_mode in [0, 1, 2, 3, 4]:
+        if cmd_mode in [MODE_IDLE, MODE_TELEOP, MODE_KINESTHETIC, MODE_NATURAL]:
             self.target_mode = cmd_mode
-            mode_names = {0: 'idle', 1: 'teleop', 2: 'freedrive', 3: 'natural', 4: 'pre-natural'}
+            mode_names = {
+                MODE_IDLE: 'idle',
+                MODE_TELEOP: 'teleop',
+                MODE_KINESTHETIC: 'freedrive',
+                MODE_NATURAL: 'natural',
+            }
             self.get_logger().info(f'Mode command received: requesting mode {cmd_mode} ({mode_names.get(cmd_mode, "unknown")})')
         else:
             self.get_logger().warn(f'Invalid mode command: {cmd_mode}')
@@ -233,84 +236,87 @@ class ModeHandler(Node):
             return False
         return (time.time() - self.last_no_contact) >= self.tool_contact_debounce_s
 
-    def mode_processor(self):
-        """Main mode processing loop"""
-        # Mode transitions
-        new_mode = self.mode
+    def attached_stably(self):
+        if not self.attached():
+            self.last_contact = None
+            return False
+        if self.last_contact is None:
+            self.last_contact = time.time()
+            return False
+        return (time.time() - self.last_contact) >= self.tool_contact_debounce_s
 
-        # Check for direct mode command override
-        manual_override = False
-        if self.target_mode is not None:
-            new_mode = self.target_mode
-            self.target_mode = None  # Clear after using
-            manual_override = True
-            self.kinesthetic_entry_armed_after_hold = False
-
+    def _kinesthetic_request_state(self):
         discrepancy = self.force_discrepancy()
         directional_discrepancy = self.kinesthetic_trigger_direction * discrepancy
-        kinesthetic_requested = directional_discrepancy >= self.force_discrepancy_threshold_z
-        kinesthetic_released = directional_discrepancy <= self.force_discrepancy_release_threshold_z
+        requested = directional_discrepancy >= self.force_discrepancy_threshold_z
+        released = directional_discrepancy <= self.force_discrepancy_release_threshold_z
         if not self.wrench_is_tared:
-            kinesthetic_requested = False
-            kinesthetic_released = True
-        if kinesthetic_requested:
+            requested = False
+            released = True
+
+        if requested:
             if self.kinesthetic_request_start is None:
                 self.kinesthetic_request_start = time.time()
-            kinesthetic_requested_held = (
-                time.time() - self.kinesthetic_request_start
-            ) >= self.kinesthetic_request_hold_s
+            held = (time.time() - self.kinesthetic_request_start) >= self.kinesthetic_request_hold_s
         else:
             self.kinesthetic_request_start = None
-            kinesthetic_requested_held = False
+            held = False
+
+        return held, released
+
+    def _automatic_mode(self):
         detached = self.detached_stably()
 
+        if self.mode == MODE_INIT:
+            return MODE_NATURAL if detached else MODE_TELEOP
+
+        if self.mode == MODE_NATURAL:
+            return MODE_TELEOP if self.attached_stably() else MODE_NATURAL
+
+        if detached:
+            self.kinesthetic_entry_armed_after_hold = False
+            return MODE_NATURAL
+
+        kinesthetic_held, kinesthetic_released = self._kinesthetic_request_state()
         if kinesthetic_released:
             self.kinesthetic_armed = True
 
-        if not manual_override:
-            if self.mode == -1:
-                new_mode = 4 if detached else 1
-            elif detached:
+        if self.mode == MODE_KINESTHETIC:
+            return MODE_TELEOP if self.curr_sm else MODE_KINESTHETIC
+
+        if self.curr_sm:
+            self.kinesthetic_entry_armed_after_hold = False
+            return MODE_TELEOP
+
+        if self.kinesthetic_entry_armed_after_hold:
+            if kinesthetic_released:
+                self.kinesthetic_armed = False
                 self.kinesthetic_entry_armed_after_hold = False
-                new_mode = 3 if self.odom_seen else 4
-                if self.mode not in (3, 4):
-                    self.start_mode_four = time.time()
-            else:
-                # Reattaching the tool should always return to teleop.
-                self.start_mode_zero = time.time()
-                if self.mode in (3, 4):
-                    new_mode = 1
-                elif self.mode == 2:
-                    # Keep freedrive latched until SpaceMouse activity requests teleop.
-                    new_mode = 1 if self.curr_sm else 2
-                elif self.curr_sm:
-                    self.kinesthetic_entry_armed_after_hold = False
-                    new_mode = 1
-                elif self.kinesthetic_entry_armed_after_hold:
-                    # Enter freedrive only after force is released to avoid entering under push.
-                    if kinesthetic_released:
-                        new_mode = 2
-                        self.kinesthetic_armed = False
-                        self.kinesthetic_entry_armed_after_hold = False
-                    else:
-                        new_mode = 1
-                elif kinesthetic_requested_held and self.kinesthetic_armed:
-                    # Arm entry after force-hold; actual switch happens on release.
-                    self.kinesthetic_entry_armed_after_hold = True
-                    new_mode = 1
-                else:
-                    new_mode = 1
+                return MODE_KINESTHETIC
+            return MODE_TELEOP
+
+        if kinesthetic_held and self.kinesthetic_armed:
+            self.kinesthetic_entry_armed_after_hold = True
+
+        return MODE_TELEOP
+
+    def mode_processor(self):
+        """Main mode processing loop."""
+        if self.target_mode is not None:
+            new_mode = self.target_mode
+            self.target_mode = None
+            self.kinesthetic_entry_armed_after_hold = False
+        else:
+            new_mode = self._automatic_mode()
 
         # Set mode and command LEDs
         if new_mode != self.mode:
             self.mode = new_mode
             self.get_logger().info(f'Mode changed to: {self.mode}')
-            self.led_pub.publish(String(data=self.mode_colors[self.mode]))
-        else:
-            self.led_pub.publish(String(data=self.mode_colors[self.mode]))
+        self.led_pub.publish(String(data=self.mode_colors.get(self.mode, 'r')))
 
         if self.enable_freedrive_controller_topic:
-            self.freedrive_pub.publish(Bool(data=(self.mode == 2)))
+            self.freedrive_pub.publish(Bool(data=(self.mode == MODE_KINESTHETIC)))
 
         # Always publish current mode
         mode_msg = Int32()
