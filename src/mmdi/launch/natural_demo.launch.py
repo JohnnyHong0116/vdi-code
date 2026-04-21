@@ -56,6 +56,12 @@ def generate_launch_description():
             output="screen",
             condition=IfCondition(use_urscript_freedrive),
         ),
+        Node(
+            package="mmdi",
+            executable="wrench_env_sensor",
+            name="wrench_env_sensor",
+            output="screen",
+        ),
         IncludeLaunchDescription(
             mmdi_launch,
             condition=IfCondition(start_mmdi),

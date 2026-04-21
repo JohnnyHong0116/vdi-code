@@ -6,6 +6,7 @@ import socket
 import struct
 
 from geometry_msgs.msg import WrenchStamped
+from rclpy.time import Time
 
 from tf2_ros.buffer import Buffer
 from tf2_ros.transform_listener import TransformListener
@@ -19,16 +20,27 @@ class WrenchEnvSensor(Node):
 
         self.get_logger().info("Starting wrench env sensor...")
 
-        self.UDP_IP = "192.168.2.1"
-        self.UDP_PORT = 49152
+        self.declare_parameter("sensor_ip", "192.168.2.1")
+        self.declare_parameter("sensor_port", 49152)
+        self.declare_parameter("base_frame", "base")
+        self.declare_parameter("tool_frame", "tool0")
+        self.declare_parameter("output_topic", "/ur7e/ft_env_sensor")
+        self.declare_parameter("rate_hz", 100.0)
+
+        self.sensor_ip = str(self.get_parameter("sensor_ip").value)
+        self.sensor_port = int(self.get_parameter("sensor_port").value)
+        self.base_frame = str(self.get_parameter("base_frame").value)
+        self.tool_frame = str(self.get_parameter("tool_frame").value)
+        self.output_topic = str(self.get_parameter("output_topic").value)
+        self.rate_hz = float(self.get_parameter("rate_hz").value)
 
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 8192)
         self.sock.setblocking(False)
-        self.sock.bind(("", self.UDP_PORT))
+        self.sock.bind(("", self.sensor_port))
 
         init_msg = bytes.fromhex("1234000200000000")
-        self.sock.sendto(init_msg, (self.UDP_IP, self.UDP_PORT))
+        self.sock.sendto(init_msg, (self.sensor_ip, self.sensor_port))
 
         self.unpacker = struct.Struct("> I I I i i i i i i")
 
@@ -36,6 +48,7 @@ class WrenchEnvSensor(Node):
         self.tf_listener = TransformListener(self.tf_buffer, self)
 
         self.tool_q = None
+        self.last_tf_error = None
         self.force_prev = None
         self.torque_prev = None
 
@@ -43,19 +56,24 @@ class WrenchEnvSensor(Node):
         self.force_bias = np.zeros(3)
         self.torque_bias = np.zeros(3)
 
-        self.pub = self.create_publisher(WrenchStamped, "/ur7e/ft_env_sensor", 1)
+        self.pub = self.create_publisher(WrenchStamped, self.output_topic, 1)
 
-        self.create_timer(0.01, self.update_tool_pose)
-        self.create_timer(0.01, self.set_raw_wrench)
+        period = 1.0 / max(self.rate_hz, 1e-6)
+        self.create_timer(period, self.update_tool_pose)
+        self.create_timer(period, self.set_raw_wrench)
 
         self.R_ftmini_to_tool = ScipyR.from_euler("z", 90.0, degrees=True)
+        self.get_logger().info(
+            f"Publishing {self.output_topic}; TF {self.base_frame} <- "
+            f"{self.tool_frame}; FTmini {self.sensor_ip}:{self.sensor_port}"
+        )
 
     def update_tool_pose(self):
         try:
             trans = self.tf_buffer.lookup_transform(
-                "base",    # 改了这里
-                "tool0",   # 改了这里
-                rclpy.time.Time()
+                self.base_frame,
+                self.tool_frame,
+                Time(),
             )
             self.tool_q = np.array([
                 trans.transform.rotation.x,
@@ -63,8 +81,10 @@ class WrenchEnvSensor(Node):
                 trans.transform.rotation.z,
                 trans.transform.rotation.w,
             ])
-        except Exception:
-            pass
+            self.last_tf_error = None
+        except Exception as exc:
+            self.tool_q = None
+            self.last_tf_error = str(exc)
 
     def read_ftmini_latest(self):
         latest = None
@@ -89,13 +109,21 @@ class WrenchEnvSensor(Node):
         return force, torque
 
     def set_raw_wrench(self):
-        if self.tool_q is None:
-            self.get_logger().warn("No TF yet (base -> tool0). Still reading FTmini.")
-            return
-
         sample = self.read_ftmini_latest()
         if sample is None:
-            self.get_logger().warn("No FTmini packets received in this tick")
+            self.get_logger().warn(
+                "No FTmini packets received",
+                throttle_duration_sec=1.0,
+            )
+            return
+
+        if self.tool_q is None:
+            detail = f": {self.last_tf_error}" if self.last_tf_error else ""
+            self.get_logger().warn(
+                f"No TF yet ({self.base_frame} <- {self.tool_frame}){detail}. "
+                "Waiting before publishing FTmini wrench.",
+                throttle_duration_sec=1.0,
+            )
             return
 
         force_s, torque_s = sample
@@ -124,7 +152,8 @@ class WrenchEnvSensor(Node):
         self.torque_prev = torque_global
 
         out = WrenchStamped()
-        out.header.frame_id = "base"
+        out.header.stamp = self.get_clock().now().to_msg()
+        out.header.frame_id = self.base_frame
         out.wrench.force.x = float(force_global[0])
         out.wrench.force.y = float(force_global[1])
         out.wrench.force.z = float(force_global[2])
@@ -138,5 +167,11 @@ class WrenchEnvSensor(Node):
 def main(args=None):
     rclpy.init(args=args)
     node = WrenchEnvSensor()
-    rclpy.spin(node)
-    rclpy.shutdown()
+    try:
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        node.sock.close()
+        node.destroy_node()
+        rclpy.shutdown()
