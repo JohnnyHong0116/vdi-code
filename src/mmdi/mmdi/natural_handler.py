@@ -123,6 +123,9 @@ class NaturalHandler(Node):
         self.declare_parameter("detach_radius_m", 0.03)
         self.declare_parameter("delta_rot_max", 0.35)
         self.declare_parameter("maxiter", 60)
+        self.declare_parameter("disable_near_attached_target", True)
+        self.declare_parameter("attached_target_camera_pos", [0.029, -0.025, 0.159])
+        self.declare_parameter("attached_target_camera_radius_m", 0.04)
 
         self.mode_topic = str(self.get_parameter("mode_topic").value)
         self.target_pose_topic = str(self.get_parameter("target_pose_topic").value)
@@ -146,6 +149,24 @@ class NaturalHandler(Node):
         self.detach_radius_m = float(self.get_parameter("detach_radius_m").value)
         self.delta_rot_max = float(self.get_parameter("delta_rot_max").value)
         self.maxiter = int(self.get_parameter("maxiter").value)
+        self.disable_near_attached_target = bool(
+            self.get_parameter("disable_near_attached_target").value
+        )
+        self.attached_target_camera_pos = np.asarray(
+            self.get_parameter("attached_target_camera_pos").value,
+            dtype=float,
+        ).reshape(-1)
+        if self.attached_target_camera_pos.size != 3:
+            self.get_logger().warn(
+                "attached_target_camera_pos must have 3 values; using default"
+            )
+            self.attached_target_camera_pos = np.array(
+                [0.029, -0.025, 0.159],
+                dtype=float,
+            )
+        self.attached_target_camera_radius_m = float(
+            self.get_parameter("attached_target_camera_radius_m").value
+        )
 
         self.tf_buffer = Buffer()
         self.tf_listener = TransformListener(self.tf_buffer, self)
@@ -158,6 +179,8 @@ class NaturalHandler(Node):
         self.target_pos = None
         self.target_quat = None
         self.last_target_update_sec = None
+        self.target_camera_pos = None
+        self.last_target_camera_update_sec = None
 
         self.pose_pub = self.create_publisher(PoseStamped, self.target_pose_topic, 1)
 
@@ -181,6 +204,11 @@ class NaturalHandler(Node):
             f"objective: align camera +z to fused tool; "
             f"detach_radius={self.detach_radius_m:.3f}m, "
             f"delta_rot={self.delta_rot_max:.3f}rad"
+        )
+        self.get_logger().info(
+            f"attached-target guard: enabled={self.disable_near_attached_target}, "
+            f"camera_pos={np.round(self.attached_target_camera_pos, 4).tolist()}, "
+            f"radius={self.attached_target_camera_radius_m:.3f}m"
         )
 
     def _now_sec(self) -> float:
@@ -246,6 +274,9 @@ class NaturalHandler(Node):
         )
         quat = _quat_from_msg(msg.pose.pose.orientation)
 
+        if frame_id == self.camera_frame:
+            self._update_target_camera_pos(pos, stamp_sec)
+
         if frame_id != self.base_frame:
             transformed = self._transform_pose_to_base(pos, quat, frame_id)
             if transformed is None:
@@ -262,6 +293,37 @@ class NaturalHandler(Node):
         self.target_pos = pos.copy()
         self.target_quat = quat.copy()
         self.last_target_update_sec = stamp_sec
+
+    def _update_target_camera_pos(self, pos: np.ndarray, stamp_sec: float):
+        if not np.isfinite(pos).all():
+            return
+        self.target_camera_pos = pos.copy()
+        self.last_target_camera_update_sec = stamp_sec
+
+    def _target_near_attached_pose(self) -> bool:
+        if not self.disable_near_attached_target:
+            return False
+        if (
+            self.target_camera_pos is None
+            or self.last_target_camera_update_sec is None
+        ):
+            return False
+
+        age = self._now_sec() - self.last_target_camera_update_sec
+        if age > self.target_timeout_sec:
+            return False
+
+        dist = float(np.linalg.norm(
+            self.target_camera_pos - self.attached_target_camera_pos
+        ))
+        near_attached = dist <= self.attached_target_camera_radius_m
+        if near_attached:
+            self.get_logger().info(
+                f"fused target near attached pose; holding natural command "
+                f"({dist:.3f}m <= {self.attached_target_camera_radius_m:.3f}m)",
+                throttle_duration_sec=1.0,
+            )
+        return near_attached
 
     def _transform_pose_to_base(
         self,
@@ -508,6 +570,10 @@ class NaturalHandler(Node):
 
         target_state = self._get_active_target_pos()
         if target_state is None:
+            self._publish_hold_pose(curr_pos, curr_rotvec)
+            return
+
+        if self._target_near_attached_pose():
             self._publish_hold_pose(curr_pos, curr_rotvec)
             return
 
