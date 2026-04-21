@@ -34,11 +34,14 @@ class ModeHandler(Node):
         self.declare_parameter('spacemouse_input_topic', '/ur7e/teleop_active')
         self.declare_parameter('external_force_topic', '/uniforce/force')
         self.declare_parameter('wrench_topic', '/force_torque_sensor_broadcaster/wrench')
+        self.declare_parameter('env_wrench_topic', '/ur7e/ft_env_sensor')
         self.declare_parameter('tool_frame', 'tool0')
         self.declare_parameter('force_discrepancy_axis_sign', -1.0)
         self.declare_parameter('kinesthetic_trigger_direction', -1.0)
         self.declare_parameter('force_discrepancy_threshold_z', 4.0)
         self.declare_parameter('force_discrepancy_release_threshold_z', 2.0)
+        self.declare_parameter('force_discrepancy_use_abs_with_env', True)
+        self.declare_parameter('env_wrench_timeout_s', 0.5)
         self.declare_parameter('kinesthetic_request_hold_s', 2.0)
         self.declare_parameter('tool_contact_debounce_s', 0.5)
         self.declare_parameter('external_force_default', 0.0)
@@ -47,6 +50,7 @@ class ModeHandler(Node):
         self.spacemouse_input_topic = self.get_parameter('spacemouse_input_topic').value
         self.external_force_topic = self.get_parameter('external_force_topic').value
         self.wrench_topic = self.get_parameter('wrench_topic').value
+        self.env_wrench_topic = self.get_parameter('env_wrench_topic').value
         self.tool_frame = self.get_parameter('tool_frame').value
         self.force_discrepancy_axis_sign = float(
             self.get_parameter('force_discrepancy_axis_sign').value
@@ -65,6 +69,12 @@ class ModeHandler(Node):
         )
         self.force_discrepancy_release_threshold_z = float(
             self.get_parameter('force_discrepancy_release_threshold_z').value
+        )
+        self.force_discrepancy_use_abs_with_env = bool(
+            self.get_parameter('force_discrepancy_use_abs_with_env').value
+        )
+        self.env_wrench_timeout_s = float(
+            self.get_parameter('env_wrench_timeout_s').value
         )
         self.kinesthetic_request_hold_s = float(
             self.get_parameter('kinesthetic_request_hold_s').value
@@ -87,6 +97,8 @@ class ModeHandler(Node):
         self.curr_sm = False
         self.external_force = self.external_force_default
         self.tool_force_z = 0.0
+        self.env_force_z = 0.0
+        self.last_env_wrench_sec = None
         self.kinesthetic_armed = True
         self.last_wrench = None
         self.last_no_contact = None
@@ -112,6 +124,8 @@ class ModeHandler(Node):
             Float32, self.external_force_topic, self.store_uni_force, 10)
         self.wrench_sub = self.create_subscription(
             WrenchStamped, self.wrench_topic, self.store_wrench_global, 10)
+        self.env_wrench_sub = self.create_subscription(
+            WrenchStamped, self.env_wrench_topic, self.store_env_wrench, 10)
         # Direct mode command subscriber
         self.mode_cmd_sub = self.create_subscription(
             Int32, '/mode_cmd', self.handle_mode_cmd, 10)
@@ -133,6 +147,7 @@ class ModeHandler(Node):
         self.get_logger().info('ModeHandler initialized, waiting for startup...')
         self.get_logger().info(f'SpaceMouse input topic: {self.spacemouse_input_topic}')
         self.get_logger().info(f'Wrench topic: {self.wrench_topic}')
+        self.get_logger().info(f'Environment wrench topic: {self.env_wrench_topic}')
         self.get_logger().info(f'External force topic: {self.external_force_topic}')
         self.get_logger().info(
             f'Kinesthetic trigger direction: {self.kinesthetic_trigger_direction:+.0f} '
@@ -164,8 +179,10 @@ class ModeHandler(Node):
     def store_uni_force(self, msg):
         self.external_force = msg.data
 
-    def store_wrench_global(self, msg):
-        self.last_wrench = msg
+    def _now_sec(self):
+        return self.get_clock().now().nanoseconds * 1e-9
+
+    def _wrench_force_z_in_tool(self, msg):
         force_tool = np.array(
             [
                 msg.wrench.force.x,
@@ -186,8 +203,16 @@ class ModeHandler(Node):
                 force_tool = ScipyR.from_quat(rot).apply(force_tool)
             except Exception as exc:
                 self.get_logger().debug(f'Wrench TF lookup failed: {exc}')
+                return None
 
-        raw_tool_force_z = float(force_tool[2])
+        return float(force_tool[2])
+
+    def store_wrench_global(self, msg):
+        self.last_wrench = msg
+        raw_tool_force_z = self._wrench_force_z_in_tool(msg)
+        if raw_tool_force_z is None:
+            return
+
         if not self.wrench_is_tared:
             self.wrench_tare_accum_z += raw_tool_force_z
             self.wrench_tare_count += 1
@@ -201,6 +226,14 @@ class ModeHandler(Node):
             return
 
         self.tool_force_z = raw_tool_force_z - self.wrench_bias_z
+
+    def store_env_wrench(self, msg):
+        env_force_z = self._wrench_force_z_in_tool(msg)
+        if env_force_z is None:
+            return
+
+        self.env_force_z = env_force_z
+        self.last_env_wrench_sec = self._now_sec()
 
     def store_tool_contact(self, msg):
         self.tool_contact = msg.data
@@ -221,8 +254,18 @@ class ModeHandler(Node):
             self.get_logger().warn(f'Invalid mode command: {cmd_mode}')
 
     def force_discrepancy(self):
+        if self.env_wrench_active():
+            return self.force_discrepancy_axis_sign * (
+                self.tool_force_z - self.env_force_z
+            )
+
         sensed_pull = self.force_discrepancy_axis_sign * self.tool_force_z
         return sensed_pull - self.external_force
+
+    def env_wrench_active(self):
+        if self.last_env_wrench_sec is None:
+            return False
+        return (self._now_sec() - self.last_env_wrench_sec) <= self.env_wrench_timeout_s
 
     def attached(self):
         return int(self.tool_contact) != 0
@@ -247,7 +290,10 @@ class ModeHandler(Node):
 
     def _kinesthetic_request_state(self):
         discrepancy = self.force_discrepancy()
-        directional_discrepancy = self.kinesthetic_trigger_direction * discrepancy
+        if self.env_wrench_active() and self.force_discrepancy_use_abs_with_env:
+            directional_discrepancy = abs(discrepancy)
+        else:
+            directional_discrepancy = self.kinesthetic_trigger_direction * discrepancy
         requested = directional_discrepancy >= self.force_discrepancy_threshold_z
         released = directional_discrepancy <= self.force_discrepancy_release_threshold_z
         if not self.wrench_is_tared:
@@ -284,10 +330,6 @@ class ModeHandler(Node):
         if self.mode == MODE_KINESTHETIC:
             return MODE_TELEOP if self.curr_sm else MODE_KINESTHETIC
 
-        if self.curr_sm:
-            self.kinesthetic_entry_armed_after_hold = False
-            return MODE_TELEOP
-
         if self.kinesthetic_entry_armed_after_hold:
             if kinesthetic_released:
                 self.kinesthetic_armed = False
@@ -297,6 +339,9 @@ class ModeHandler(Node):
 
         if kinesthetic_held and self.kinesthetic_armed:
             self.kinesthetic_entry_armed_after_hold = True
+
+        if self.curr_sm:
+            return MODE_TELEOP
 
         return MODE_TELEOP
 
