@@ -7,6 +7,9 @@ tool while staying near the detach pose:
 
     (normalize(p_fused_tool - p_camera) dot z_camera - 1)^2
 
+It can also bias the camera roll so the fused tool +Y direction appears along
+camera +Y after projection into the image/look plane.
+
 The command is constrained to a spherical radius around the detach pose.
 """
 
@@ -101,6 +104,62 @@ def camera_z_alignment_residual(
     return float((np.dot(cam_to_target, z_cam) - 1.0) ** 2)
 
 
+def camera_fused_y_alignment_residual(
+    cam_to_target: np.ndarray,
+    cam_rot: ScipyR,
+    target_quat: np.ndarray,
+) -> float:
+    r_target = ScipyR.from_quat(target_quat)
+    fused_y = r_target.as_matrix()[:, 1]
+    fused_y_proj = _normalize(
+        fused_y - np.dot(fused_y, cam_to_target) * cam_to_target
+    )
+    if fused_y_proj is None:
+        return 0.0
+
+    y_cam = cam_rot.as_matrix()[:, 1]
+    return float((np.dot(fused_y_proj, y_cam) - 1.0) ** 2)
+
+
+def camera_alignment_residual(
+    x: np.ndarray,
+    curr_pos: np.ndarray,
+    curr_rotvec: np.ndarray,
+    target_pos: np.ndarray,
+    target_quat: np.ndarray,
+    trans_tool_cam,
+    fused_y_weight: float,
+) -> float:
+    z_residual = camera_z_alignment_residual(
+        x,
+        curr_pos,
+        curr_rotvec,
+        target_pos,
+        trans_tool_cam,
+    )
+    if fused_y_weight <= 0.0:
+        return z_residual
+
+    tool_pos = np.asarray(curr_pos, dtype=float) + np.asarray(x[:3], dtype=float)
+    tool_rot = ScipyR.from_rotvec(x[3:6]) * ScipyR.from_rotvec(curr_rotvec)
+    cam_pos, cam_rot = _camera_pose_from_tool_rotation(
+        tool_pos,
+        tool_rot,
+        trans_tool_cam,
+    )
+
+    cam_to_target = _normalize(target_pos - cam_pos)
+    if cam_to_target is None:
+        return 1e3
+
+    y_residual = camera_fused_y_alignment_residual(
+        cam_to_target,
+        cam_rot,
+        target_quat,
+    )
+    return float(z_residual + fused_y_weight * y_residual)
+
+
 class NaturalHandler(Node):
     def __init__(self):
         super().__init__("natural_handler")
@@ -123,6 +182,7 @@ class NaturalHandler(Node):
         self.declare_parameter("detach_radius_m", 0.03)
         self.declare_parameter("delta_rot_max", 0.35)
         self.declare_parameter("maxiter", 60)
+        self.declare_parameter("fused_y_alignment_weight", 0.1)
         self.declare_parameter("disable_near_attached_target", True)
         self.declare_parameter("attached_target_camera_pos", [0.029, -0.025, 0.159])
         self.declare_parameter("attached_target_camera_radius_m", 0.04)
@@ -149,6 +209,9 @@ class NaturalHandler(Node):
         self.detach_radius_m = float(self.get_parameter("detach_radius_m").value)
         self.delta_rot_max = float(self.get_parameter("delta_rot_max").value)
         self.maxiter = int(self.get_parameter("maxiter").value)
+        self.fused_y_alignment_weight = float(
+            self.get_parameter("fused_y_alignment_weight").value
+        )
         self.disable_near_attached_target = bool(
             self.get_parameter("disable_near_attached_target").value
         )
@@ -201,7 +264,9 @@ class NaturalHandler(Node):
             f"camera={self.camera_frame}, target={self.target_frame}"
         )
         self.get_logger().info(
-            f"objective: align camera +z to fused tool; "
+            f"objective: align camera +z to fused tool, "
+            f"bias camera +y to projected fused +y; "
+            f"fused_y_weight={self.fused_y_alignment_weight:.3f}, "
             f"detach_radius={self.detach_radius_m:.3f}m, "
             f"delta_rot={self.delta_rot_max:.3f}rad"
         )
@@ -288,8 +353,10 @@ class NaturalHandler(Node):
     def _update_target(self, pos: np.ndarray, quat: np.ndarray, stamp_sec: float):
         if not np.isfinite(pos).all():
             return
-        if np.linalg.norm(quat) < 1e-9:
+        if (not np.isfinite(quat).all()) or np.linalg.norm(quat) < 1e-9:
             quat = np.array([0.0, 0.0, 0.0, 1.0], dtype=float)
+        else:
+            quat = quat / np.linalg.norm(quat)
         self.target_pos = pos.copy()
         self.target_quat = quat.copy()
         self.last_target_update_sec = stamp_sec
@@ -376,12 +443,18 @@ class NaturalHandler(Node):
         rotvec = ScipyR.from_quat(quat).as_rotvec()
         return pos, rotvec, trans_tool_cam
 
-    def _get_active_target_pos(self) -> Optional[Tuple[np.ndarray, float]]:
+    def _get_active_target_pose(
+        self,
+    ) -> Optional[Tuple[np.ndarray, np.ndarray, float]]:
         now_sec = self._now_sec()
-        if self.target_pos is not None and self.last_target_update_sec is not None:
+        if (
+            self.target_pos is not None
+            and self.target_quat is not None
+            and self.last_target_update_sec is not None
+        ):
             age = now_sec - self.last_target_update_sec
             if age <= self.target_timeout_sec:
-                return self.target_pos.copy(), age
+                return self.target_pos.copy(), self.target_quat.copy(), age
 
         if not self.use_tf_target_fallback:
             return None
@@ -406,7 +479,8 @@ class NaturalHandler(Node):
         stamp_sec = _stamp_to_sec(trans.header.stamp)
         if stamp_sec <= 0.0:
             stamp_sec = now_sec
-        return pos, now_sec - stamp_sec
+        quat = _quat_from_msg(trans.transform.rotation)
+        return pos, quat, now_sec - stamp_sec
 
     def _latch_detach_pose(
         self,
@@ -495,19 +569,22 @@ class NaturalHandler(Node):
         curr_pos: np.ndarray,
         curr_rotvec: np.ndarray,
         target_pos: np.ndarray,
+        target_quat: np.ndarray,
         trans_tool_cam,
     ) -> Tuple[np.ndarray, np.ndarray]:
         x0, bounds = self._build_bounds(curr_pos)
 
         try:
             res = minimize(
-                camera_z_alignment_residual,
+                camera_alignment_residual,
                 x0,
                 args=(
                     curr_pos,
                     curr_rotvec,
                     target_pos,
+                    target_quat,
                     trans_tool_cam,
+                    self.fused_y_alignment_weight,
                 ),
                 method="SLSQP",
                 bounds=bounds,
@@ -568,7 +645,7 @@ class NaturalHandler(Node):
             return
         curr_pos, curr_rotvec, trans_tool_cam = tool_state
 
-        target_state = self._get_active_target_pos()
+        target_state = self._get_active_target_pose()
         if target_state is None:
             self._publish_hold_pose(curr_pos, curr_rotvec)
             return
@@ -577,7 +654,7 @@ class NaturalHandler(Node):
             self._publish_hold_pose(curr_pos, curr_rotvec)
             return
 
-        target_pos, stale_age = target_state
+        target_pos, target_quat, stale_age = target_state
         if stale_age > self.hard_stale_sec:
             self._publish_hold_pose(curr_pos, curr_rotvec)
             self.get_logger().warn(
@@ -590,6 +667,7 @@ class NaturalHandler(Node):
             curr_pos,
             curr_rotvec,
             target_pos,
+            target_quat,
             trans_tool_cam,
         )
         self._publish_target_pose(new_pos, new_quat)
