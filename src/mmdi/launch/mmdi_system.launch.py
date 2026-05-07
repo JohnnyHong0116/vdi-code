@@ -127,6 +127,9 @@ def generate_launch_description():
             parameters=[{
                 'max_relative_euler_deg': [25.0, 25.0, 45.0],
                 'max_relative_rotation_deg': 45.0,
+                'delta_pos_max_m': 0.015,
+                'global_tool_pos_min': [0.18, -0.28, 0.25],
+                'global_tool_pos_max': [0.38, 0.28, 0.45],
             }]
         ),
     ])

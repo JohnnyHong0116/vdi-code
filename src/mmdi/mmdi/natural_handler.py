@@ -3,16 +3,17 @@
 
 This node keeps the camera-to-arm transform from TF, records the arm pose when
 mode 3 starts, and optimizes the tool pose so the camera points at the tracked
-tool while staying near the detach pose:
+tool while staying inside global tool workspace bounds:
 
     (normalize(p_fused_tool - p_camera) dot z_camera - 1)^2
 
 It can also bias the camera roll so the fused tool +Y direction appears along
 camera +Y after projection into the image/look plane.
 
-The command is constrained to a spherical radius around the detach pose. The
-tool orientation is also constrained to a detach-relative Euler region and
-maximum total rotation so camera wiring is not driven through excessive twists.
+The command is constrained by global position bounds plus per-tick position and
+rotation limits. Tool orientation is constrained to a detach-relative Euler
+region and maximum total rotation so camera wiring is not driven through
+excessive twists.
 """
 
 import warnings
@@ -182,10 +183,12 @@ class NaturalHandler(Node):
         self.declare_parameter("hard_stale_sec", 1.0)
         self.declare_parameter("use_tf_target_fallback", True)
 
-        self.declare_parameter("detach_radius_m", 0.03)
+        self.declare_parameter("delta_pos_max_m", 0.015)
         self.declare_parameter("delta_rot_max", 0.35)
         self.declare_parameter("max_relative_euler_deg", [25.0, 25.0, 45.0])
         self.declare_parameter("max_relative_rotation_deg", 45.0)
+        self.declare_parameter("global_tool_pos_min", [0.18, -0.28, 0.25])
+        self.declare_parameter("global_tool_pos_max", [0.38, 0.28, 0.45])
         self.declare_parameter("maxiter", 60)
         self.declare_parameter("fused_y_alignment_weight", 0.1)
         self.declare_parameter("disable_near_attached_target", True)
@@ -211,11 +214,22 @@ class NaturalHandler(Node):
             self.get_parameter("use_tf_target_fallback").value
         )
 
-        self.detach_radius_m = float(self.get_parameter("detach_radius_m").value)
+        self.delta_pos_max_m = max(
+            0.0,
+            float(self.get_parameter("delta_pos_max_m").value),
+        )
         self.delta_rot_max = float(self.get_parameter("delta_rot_max").value)
         self.max_relative_euler_rad = self._get_euler_limit_parameter()
         self.max_relative_rotation_rad = np.deg2rad(
             max(0.0, float(self.get_parameter("max_relative_rotation_deg").value))
+        )
+        self.global_tool_pos_min = self._get_vector_parameter(
+            "global_tool_pos_min",
+            [0.18, -0.28, 0.25],
+        )
+        self.global_tool_pos_max = self._get_vector_parameter(
+            "global_tool_pos_max",
+            [0.38, 0.28, 0.45],
         )
         self.maxiter = int(self.get_parameter("maxiter").value)
         self.fused_y_alignment_weight = float(
@@ -276,12 +290,17 @@ class NaturalHandler(Node):
             f"objective: align camera +z to fused tool, "
             f"bias camera +y to projected fused +y; "
             f"fused_y_weight={self.fused_y_alignment_weight:.3f}, "
-            f"detach_radius={self.detach_radius_m:.3f}m, "
+            f"delta_pos={self.delta_pos_max_m:.3f}m, "
             f"delta_rot={self.delta_rot_max:.3f}rad, "
             f"relative_euler_limit="
             f"{np.round(np.rad2deg(self.max_relative_euler_rad), 1).tolist()}deg, "
             f"relative_rotation_limit="
             f"{np.rad2deg(self.max_relative_rotation_rad):.1f}deg"
+        )
+        self.get_logger().info(
+            f"global tool bounds: "
+            f"{np.round(self.global_tool_pos_min, 3).tolist()} -> "
+            f"{np.round(self.global_tool_pos_max, 3).tolist()}"
         )
         self.get_logger().info(
             f"attached-target guard: enabled={self.disable_near_attached_target}, "
@@ -304,14 +323,19 @@ class NaturalHandler(Node):
             raw = np.array([25.0, 25.0, 45.0], dtype=float)
         return np.deg2rad(np.maximum(raw, 0.0))
 
+    def _get_vector_parameter(self, name: str, default) -> np.ndarray:
+        raw = np.asarray(self.get_parameter(name).value, dtype=float).reshape(-1)
+        if raw.size != 3:
+            self.get_logger().warn(f"{name} must have 3 values; using default")
+            raw = np.asarray(default, dtype=float)
+        return raw
+
     def on_mode(self, msg: Int32):
         prev_mode = self.mode
         self.mode = int(msg.data)
 
         if prev_mode != NATURAL_MODE and self.mode == NATURAL_MODE:
-            self.detach_pos = None
-            self.detach_rotvec = None
-            self.detach_camera_pos = None
+            self._reset_natural_state()
             self.get_logger().info("natural mode entered; waiting to latch detach pose")
             self._ensure_detach_pose_latched()
 
@@ -321,9 +345,12 @@ class NaturalHandler(Node):
                 curr_pos, curr_rotvec, _ = tool_state
                 curr_quat = ScipyR.from_rotvec(curr_rotvec).as_quat()
                 self._publish_target_pose(curr_pos, curr_quat, clamp=False)
-            self.detach_pos = None
-            self.detach_rotvec = None
-            self.detach_camera_pos = None
+            self._reset_natural_state()
+
+    def _reset_natural_state(self):
+        self.detach_pos = None
+        self.detach_rotvec = None
+        self.detach_camera_pos = None
 
     def on_fused_pose(self, msg: PoseWithCovarianceStamped):
         frame_id = msg.header.frame_id if msg.header.frame_id else self.base_frame
@@ -543,13 +570,26 @@ class NaturalHandler(Node):
         curr_pos: np.ndarray,
         curr_rotvec: np.ndarray,
     ) -> Tuple[np.ndarray, list]:
-        anchor_min = self.detach_pos - self.detach_radius_m
-        anchor_max = self.detach_pos + self.detach_radius_m
         bounds = []
 
+        workspace_center = 0.5 * (
+            self.global_tool_pos_min + self.global_tool_pos_max
+        )
         for axis in range(3):
-            low = anchor_min[axis] - curr_pos[axis]
-            high = anchor_max[axis] - curr_pos[axis]
+            low = self.global_tool_pos_min[axis] - curr_pos[axis]
+            high = self.global_tool_pos_max[axis] - curr_pos[axis]
+            if self.delta_pos_max_m > 1e-9:
+                low = max(low, -self.delta_pos_max_m)
+                high = min(high, self.delta_pos_max_m)
+            if low > high:
+                step = workspace_center[axis] - curr_pos[axis]
+                if self.delta_pos_max_m > 1e-9:
+                    step = np.clip(
+                        step,
+                        -self.delta_pos_max_m,
+                        self.delta_pos_max_m,
+                    )
+                low = high = float(step)
             bounds.append((float(low), float(high)))
 
         for axis in range(3):
@@ -561,18 +601,11 @@ class NaturalHandler(Node):
             )
 
         x0 = np.zeros(6, dtype=float)
-        if self.detach_pos is not None:
-            x0[:3] = self._clamp_to_detach_radius(curr_pos) - curr_pos
+        x0[:3] = self._clamp_to_global_tool_bounds(curr_pos) - curr_pos
         x0[3:6] = self._initial_rotation_step(curr_rotvec)
         for idx, (low, high) in enumerate(bounds):
             x0[idx] = np.clip(x0[idx], low, high)
         return x0, bounds
-
-    def _detach_radius_constraint(self, x: np.ndarray, curr_pos: np.ndarray) -> float:
-        if self.detach_pos is None:
-            return 0.0
-        cmd_pos = curr_pos + x[:3]
-        return float(self.detach_radius_m - np.linalg.norm(cmd_pos - self.detach_pos))
 
     def _candidate_tool_rotation(
         self,
@@ -699,21 +732,19 @@ class NaturalHandler(Node):
             return self._limit_rotation_step(feasible_rot, curr_rot)
         return feasible_rot
 
-    def _clamp_to_detach_radius(self, pos: np.ndarray) -> np.ndarray:
-        if self.detach_pos is None or self.detach_radius_m <= 1e-9:
-            return pos
-
-        offset = pos - self.detach_pos
-        dist = float(np.linalg.norm(offset))
-        if dist <= self.detach_radius_m:
-            return pos
-
-        clamped = self.detach_pos + (offset / dist) * self.detach_radius_m
-        self.get_logger().warn(
-            f"natural command clamped to detach radius "
-            f"({dist:.4f}m > {self.detach_radius_m:.4f}m)",
-            throttle_duration_sec=1.0,
+    def _clamp_to_global_tool_bounds(self, pos: np.ndarray) -> np.ndarray:
+        return np.minimum(
+            np.maximum(np.asarray(pos, dtype=float), self.global_tool_pos_min),
+            self.global_tool_pos_max,
         )
+
+    def _clamp_command_position(self, pos: np.ndarray) -> np.ndarray:
+        clamped = self._clamp_to_global_tool_bounds(pos)
+        if np.linalg.norm(clamped - pos) > 1e-9:
+            self.get_logger().warn(
+                "natural command clamped to global tool bounds",
+                throttle_duration_sec=1.0,
+            )
         return clamped
 
     def optimize_pose(
@@ -725,6 +756,18 @@ class NaturalHandler(Node):
         trans_tool_cam,
     ) -> Tuple[np.ndarray, np.ndarray]:
         x0, bounds = self._build_bounds(curr_pos, curr_rotvec)
+        constraints = [
+            {
+                "type": "ineq",
+                "fun": self._relative_euler_constraint,
+                "args": (curr_rotvec,),
+            },
+            {
+                "type": "ineq",
+                "fun": self._relative_rotation_constraint,
+                "args": (curr_rotvec,),
+            },
+        ]
 
         try:
             res = minimize(
@@ -740,23 +783,7 @@ class NaturalHandler(Node):
                 ),
                 method="SLSQP",
                 bounds=bounds,
-                constraints=(
-                    {
-                        "type": "ineq",
-                        "fun": self._detach_radius_constraint,
-                        "args": (curr_pos,),
-                    },
-                    {
-                        "type": "ineq",
-                        "fun": self._relative_euler_constraint,
-                        "args": (curr_rotvec,),
-                    },
-                    {
-                        "type": "ineq",
-                        "fun": self._relative_rotation_constraint,
-                        "args": (curr_rotvec,),
-                    },
-                ),
+                constraints=tuple(constraints),
                 options={"disp": False, "maxiter": self.maxiter, "ftol": 1e-6},
             )
             x_opt = res.x if res.success else x0
@@ -771,7 +798,7 @@ class NaturalHandler(Node):
         rot = ScipyR.from_rotvec(x_opt[3:6]) * ScipyR.from_rotvec(curr_rotvec)
         rot = self._limit_tool_rotation(rot, curr_rotvec)
         quat = rot.as_quat()
-        pos = self._clamp_to_detach_radius(pos)
+        pos = self._clamp_command_position(pos)
         return pos, quat
 
     def _publish_target_pose(
@@ -781,7 +808,7 @@ class NaturalHandler(Node):
         clamp: bool = True,
     ):
         if clamp:
-            pos = self._clamp_to_detach_radius(pos)
+            pos = self._clamp_command_position(pos)
 
         msg = PoseStamped()
         msg.header.stamp = self.get_clock().now().to_msg()
