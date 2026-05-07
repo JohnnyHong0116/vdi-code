@@ -30,7 +30,36 @@ def generate_launch_description():
             package='mmdi',
             executable='probe_tracker',
             name='probe_tracker',
-            output='screen'
+            output='screen',
+            parameters=[{
+                'use_infrared': False,
+                'camera_width': 848,
+                'camera_height': 480,
+                'camera_fps': 60,
+                'show_gui': True,
+                'n_particles': 2500,
+                'process_noise': 0.003,
+                'meas_noise': 0.010,
+                'velocity_noise': 0.025,
+                'velocity_decay': 0.90,
+                'pf_injection_rate': 0.12,
+                'pf_injection_trigger_m': 0.008,
+                'pf_injection_ramp_m': 0.015,
+                'min_tag_confirm_frames': 1,
+                'single_tag_alpha_scale': 0.75,
+                'min_pos_alpha': 0.55,
+                'position_response_m': 0.008,
+                'measurement_velocity_alpha': 0.45,
+                'prediction_lead_s': 0.008,
+                'min_rot_alpha': 0.45,
+                'rotation_response_deg': 4.0,
+                'use_aruco3_detection': True,
+                'debug_publish_hz': 10.0,
+                'marker_publish_hz': 15.0,
+                'camera_info_publish_hz': 2.0,
+                'enable_latency_diagnostics': False,
+                'latency_log_interval_s': 1.0,
+            }]
         ),
 
         # Static transform: hand_e_link -> hande_link_tool
@@ -94,6 +123,10 @@ def generate_launch_description():
             package='mmdi',
             executable='natural_handler',
             name='natural_handler',
-            output='screen'
+            output='screen',
+            parameters=[{
+                'max_relative_euler_deg': [25.0, 25.0, 45.0],
+                'max_relative_rotation_deg': 45.0,
+            }]
         ),
     ])

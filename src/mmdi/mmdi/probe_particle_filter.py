@@ -361,6 +361,21 @@ class ProbeParticleFilter:
         self.weights[worst_idxs] = 1.0 / self.n
         self.weights /= self.weights.sum() + 1e-300
 
+    def correct_velocity(self, measured_velocity, alpha):
+        """Blend particle velocities toward frame-to-frame measured velocity."""
+        if not self.initialized or self.velocities is None:
+            return
+        measured_velocity = np.asarray(measured_velocity, dtype=np.float64)
+        if not np.isfinite(measured_velocity).all():
+            return
+        alpha = float(np.clip(alpha, 0.0, 1.0))
+        if alpha <= 0.0:
+            return
+        self.velocities = (
+            (1.0 - alpha) * self.velocities
+            + alpha * measured_velocity.reshape(1, 3)
+        )
+
     def _systematic_resample(self):
         cumsum = np.cumsum(self.weights)
         cumsum[-1] = 1.0
