@@ -18,6 +18,7 @@ Pipeline:
 """
 
 import threading
+import time
 
 import cv2
 import numpy as np
@@ -328,6 +329,8 @@ class ProbeTracker(Node):
         self.declare_parameter('min_pos_alpha', 0.28)
         self.declare_parameter('max_pos_alpha', 1.0)
         self.declare_parameter('position_response_m', 0.02)
+        self.declare_parameter('measurement_velocity_alpha', 0.0)
+        self.declare_parameter('prediction_lead_s', 0.0)
         self.declare_parameter('min_rot_alpha', 0.24)
         self.declare_parameter('max_rot_alpha', 1.0)
         self.declare_parameter('rotation_response_deg', 8.0)
@@ -335,6 +338,11 @@ class ProbeTracker(Node):
         self.declare_parameter('markers_topic', '/probe_tracker/markers')
         self.declare_parameter('camera_info_topic', '/probe_tracker/camera_info')
         self.declare_parameter('marker_lifetime_s', 0.25)
+        self.declare_parameter('debug_publish_hz', 30.0)
+        self.declare_parameter('marker_publish_hz', 30.0)
+        self.declare_parameter('camera_info_publish_hz', 5.0)
+        self.declare_parameter('enable_latency_diagnostics', False)
+        self.declare_parameter('latency_log_interval_s', 1.0)
 
         self.marker_m = self.get_parameter('marker_mm').value / 1000.0
         self.cam_w = self.get_parameter('camera_width').value
@@ -400,6 +408,17 @@ class ProbeTracker(Node):
         self.min_pos_alpha = self.get_parameter('min_pos_alpha').value
         self.max_pos_alpha = self.get_parameter('max_pos_alpha').value
         self.position_response_m = self.get_parameter('position_response_m').value
+        self.measurement_velocity_alpha = float(
+            np.clip(
+                self.get_parameter('measurement_velocity_alpha').value,
+                0.0,
+                1.0,
+            )
+        )
+        self.prediction_lead_s = max(
+            0.0,
+            float(self.get_parameter('prediction_lead_s').value),
+        )
         self.min_rot_alpha = self.get_parameter('min_rot_alpha').value
         self.max_rot_alpha = self.get_parameter('max_rot_alpha').value
         self.rotation_response_deg = (
@@ -411,6 +430,18 @@ class ProbeTracker(Node):
         self.marker_lifetime = Duration(
             seconds=float(self.get_parameter('marker_lifetime_s').value)
         ).to_msg()
+        self.debug_publish_hz = float(self.get_parameter('debug_publish_hz').value)
+        self.marker_publish_hz = float(self.get_parameter('marker_publish_hz').value)
+        self.camera_info_publish_hz = float(
+            self.get_parameter('camera_info_publish_hz').value
+        )
+        self.enable_latency_diagnostics = bool(
+            self.get_parameter('enable_latency_diagnostics').value
+        )
+        self.latency_log_interval_s = max(
+            0.25,
+            float(self.get_parameter('latency_log_interval_s').value),
+        )
 
         # ---- Probe geometry -------------------------------------------------
         active_ids = [tid for tid in TAG_IDS if tid not in DEFAULT_IGNORE_IDS]
@@ -452,9 +483,19 @@ class ProbeTracker(Node):
         self.prev_velocity = np.zeros(3, dtype=np.float64)
         self.last_process_time = None
         self.last_measurement_time = None
+        self.last_raw_measurement_time = None
+        self.last_raw_measurement_pos = None
         self.last_fused_publish_sec = None
         self.last_fused_publish_pos = None
         self.last_fused_publish_rot = None
+        self.last_debug_publish_sec = None
+        self.last_marker_publish_sec = None
+        self.last_camera_info_publish_sec = None
+        self.last_latency_log_sec = None
+        self.capture_frame_count = 0
+        self.process_frame_count = 0
+        self.published_pose_count = 0
+        self.dropped_frame_count = 0
         self.frame_index = 0
         self.tag_confirm_count = {}
         self.tag_last_seen_frame = {}
@@ -518,6 +559,14 @@ class ProbeTracker(Node):
             f'confirm_frames={self.min_tag_confirm_frames}, '
             f'confirm_gap={self.max_tag_confirm_gap_frames}, '
             f'single_tag_max_jump={self.single_tag_max_jump_m:.3f}m'
+        )
+        self.get_logger().info(
+            'Latency tuning: '
+            f'pos_alpha=[{self.min_pos_alpha:.2f}, {self.max_pos_alpha:.2f}], '
+            f'pos_response={self.position_response_m:.3f}m, '
+            f'single_tag_alpha_scale={self.single_tag_alpha_scale:.2f}, '
+            f'vel_alpha={self.measurement_velocity_alpha:.2f}, '
+            f'prediction_lead={self.prediction_lead_s*1000.0:.1f}ms'
         )
 
     # -----------------------------------------------------------------------
@@ -666,8 +715,12 @@ class ProbeTracker(Node):
                 if not rs_frame:
                     continue
                 img = np.asanyarray(rs_frame.get_data())
+                capture_sec = self.get_clock().now().nanoseconds * 1e-9
                 with self._frame_lock:
-                    self._latest_frame = img
+                    if self._latest_frame is not None:
+                        self.dropped_frame_count += 1
+                    self._latest_frame = (img, capture_sec)
+                    self.capture_frame_count += 1
 
         except Exception as e:
             self.get_logger().error(f'RealSense capture failed: {e}')
@@ -681,7 +734,17 @@ class ProbeTracker(Node):
     # -----------------------------------------------------------------------
     # Per-frame processing
     # -----------------------------------------------------------------------
+    @staticmethod
+    def _rate_due(last_sec, now_sec, hz):
+        hz = float(hz)
+        if hz <= 0.0:
+            return False
+        if last_sec is None:
+            return True
+        return (now_sec - last_sec) >= (1.0 / hz)
+
     def _process_frame(self):
+        process_start = time.perf_counter()
         now_time = self.get_clock().now()
         now_sec = now_time.nanoseconds * 1e-9
         self.frame_index += 1
@@ -692,22 +755,27 @@ class ProbeTracker(Node):
         self.last_process_time = now_sec
 
         with self._frame_lock:
-            frame = self._latest_frame
+            latest_frame = self._latest_frame
             self._latest_frame = None
-        if frame is None or self.camera_matrix is None:
+        if latest_frame is None or self.camera_matrix is None:
             return
+        frame, capture_sec = latest_frame
+        self.process_frame_count += 1
+        capture_age_ms = max(0.0, (now_sec - capture_sec) * 1000.0)
 
         if frame.ndim == 2:
             gray = frame
             frame = cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)
         else:
             gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        detect_start = time.perf_counter()
         corners, ids, _ = detect_markers_with_fallback(
             gray,
             self.aruco_dict,
             self.aruco_params,
             use_clahe=(self.use_infrared and self.use_clahe_detection),
         )
+        detect_ms = (time.perf_counter() - detect_start) * 1000.0
 
         if self.pf.initialized:
             self.pf.predict(dt)
@@ -802,6 +870,7 @@ class ProbeTracker(Node):
                 )
 
         # Gate and filter
+        filter_start = time.perf_counter()
         fused_pos = None
         fused_rot = None
 
@@ -823,6 +892,26 @@ class ProbeTracker(Node):
             )
 
             if meas_positions.shape[0] > 0:
+                meas_mean = np.average(meas_positions, axis=0, weights=clean_weights)
+                measured_velocity = None
+                if (
+                    self.last_raw_measurement_pos is not None
+                    and self.last_raw_measurement_time is not None
+                    and now_sec > self.last_raw_measurement_time
+                ):
+                    meas_dt = max(now_sec - self.last_raw_measurement_time, 1e-6)
+                    measured_velocity = (
+                        meas_mean - self.last_raw_measurement_pos
+                    ) / meas_dt
+                    self.prev_velocity = (
+                        (1.0 - self.measurement_velocity_alpha)
+                        * self.prev_velocity
+                        + self.measurement_velocity_alpha
+                        * measured_velocity
+                    )
+                self.last_raw_measurement_pos = meas_mean.copy()
+                self.last_raw_measurement_time = now_sec
+
                 if not self.pf.initialized:
                     self.pf.init_from_measurements(
                         meas_positions,
@@ -830,6 +919,11 @@ class ProbeTracker(Node):
                     )
                 else:
                     self.pf.update(meas_positions, clean_weights)
+                    if measured_velocity is not None:
+                        self.pf.correct_velocity(
+                            measured_velocity,
+                            self.measurement_velocity_alpha,
+                        )
 
                 raw_pos = self.pf.estimate_position()
                 raw_vel = self.pf.estimate_velocity()
@@ -891,6 +985,12 @@ class ProbeTracker(Node):
                 if raw_vel is not None:
                     self.prev_velocity = raw_vel
                 self.last_measurement_time = now_sec
+        filter_ms = (time.perf_counter() - filter_start) * 1000.0
+
+        if fused_pos is not None and self.prediction_lead_s > 0.0:
+            fused_pos = fused_pos + (self.prev_velocity * self.prediction_lead_s)
+            self.filtered_pos = fused_pos
+            self.prev_estimate = fused_pos
 
         if (
             fused_pos is None
@@ -914,39 +1014,102 @@ class ProbeTracker(Node):
             )
             self._publish_tf(fused_pos, quat, now)
             self._publish_vo(fused_pos, quat, fused_lin_vel, fused_ang_vel, now)
-        self._publish_markers(detected_tag_poses, fused_pos, fused_rot, now)
+            self.published_pose_count += 1
 
-        # Debug image + GUI
-        if fused_pos is not None and fused_rot is not None:
-            # Display fix is only for visualization. The published state keeps the
-            # physically consistent probe frame and is not altered for screen-up.
-            fused_rot_disp = fused_rot @ self.R_probe_display_fix
-            draw_axes(frame, self.camera_matrix, self.dist_coeffs,
-                      fused_rot_disp, fused_pos, axis_len=0.06, thickness=3)
-            euler = SciRot.from_matrix(fused_rot_disp).as_euler(
-                'xyz', degrees=True)
-            cv2.putText(
-                frame,
-                f'FUSED: [{fused_pos[0]:.4f}, {fused_pos[1]:.4f}, {fused_pos[2]:.4f}]',
-                (12, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2,
-                cv2.LINE_AA)
-            cv2.putText(
-                frame,
-                f'ROT:   [{euler[0]:.1f}, {euler[1]:.1f}, {euler[2]:.1f}]',
-                (12, 70), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2,
-                cv2.LINE_AA)
+        if self._rate_due(self.last_marker_publish_sec, now_sec, self.marker_publish_hz):
+            self._publish_markers(detected_tag_poses, fused_pos, fused_rot, now)
+            self.last_marker_publish_sec = now_sec
 
-        n_tags = len(ids) if ids is not None else 0
-        cv2.putText(frame, f'Tags: {n_tags}', (12, 25),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2,
+        debug_due = (
+            self.debug_pub.get_subscription_count() > 0
+            and self._rate_due(self.last_debug_publish_sec, now_sec, self.debug_publish_hz)
+        )
+        need_visuals = self.show_gui or debug_due
+        if need_visuals:
+            if fused_pos is not None and fused_rot is not None:
+                # Display fix is only for visualization. The published state keeps the
+                # physically consistent probe frame and is not altered for screen-up.
+                fused_rot_disp = fused_rot @ self.R_probe_display_fix
+                draw_axes(frame, self.camera_matrix, self.dist_coeffs,
+                          fused_rot_disp, fused_pos, axis_len=0.06, thickness=3)
+                euler = SciRot.from_matrix(fused_rot_disp).as_euler(
+                    'xyz', degrees=True)
+                cv2.putText(
+                    frame,
+                    f'FUSED: [{fused_pos[0]:.4f}, {fused_pos[1]:.4f}, {fused_pos[2]:.4f}]',
+                    (12, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2,
+                    cv2.LINE_AA)
+                cv2.putText(
+                    frame,
+                    f'ROT:   [{euler[0]:.1f}, {euler[1]:.1f}, {euler[2]:.1f}]',
+                    (12, 70), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2,
                     cv2.LINE_AA)
 
-        self._publish_debug(frame, now)
-        self._publish_camera_info(now)
+            n_tags = len(ids) if ids is not None else 0
+            cv2.putText(frame, f'Tags: {n_tags}', (12, 25),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2,
+                        cv2.LINE_AA)
 
-        if self.show_gui:
-            cv2.imshow('Probe Tracker', frame)
-            cv2.waitKey(1)
+            if debug_due:
+                self._publish_debug(frame, now)
+                self.last_debug_publish_sec = now_sec
+
+            if self.show_gui:
+                cv2.imshow('Probe Tracker', frame)
+                cv2.waitKey(1)
+
+        if self._rate_due(
+            self.last_camera_info_publish_sec,
+            now_sec,
+            self.camera_info_publish_hz,
+        ):
+            self._publish_camera_info(now)
+            self.last_camera_info_publish_sec = now_sec
+
+        process_ms = (time.perf_counter() - process_start) * 1000.0
+        if self.enable_latency_diagnostics:
+            self._log_latency_diagnostics(
+                now_sec,
+                capture_age_ms,
+                detect_ms,
+                filter_ms,
+                process_ms,
+            )
+
+    def _log_latency_diagnostics(
+        self,
+        now_sec,
+        capture_age_ms,
+        detect_ms,
+        filter_ms,
+        process_ms,
+    ):
+        if (
+            self.last_latency_log_sec is not None
+            and (now_sec - self.last_latency_log_sec) < self.latency_log_interval_s
+        ):
+            return
+
+        interval = self.latency_log_interval_s
+        if self.last_latency_log_sec is not None:
+            interval = max(now_sec - self.last_latency_log_sec, 1e-6)
+
+        cap_fps = self.capture_frame_count / interval
+        proc_fps = self.process_frame_count / interval
+        pub_fps = self.published_pose_count / interval
+        self.get_logger().info(
+            "ProbeTracker latency: "
+            f"capture_age={capture_age_ms:.1f}ms, "
+            f"detect={detect_ms:.1f}ms, filter={filter_ms:.1f}ms, "
+            f"process={process_ms:.1f}ms, "
+            f"capture_fps={cap_fps:.1f}, process_fps={proc_fps:.1f}, "
+            f"publish_fps={pub_fps:.1f}, dropped={self.dropped_frame_count}"
+        )
+        self.last_latency_log_sec = now_sec
+        self.capture_frame_count = 0
+        self.process_frame_count = 0
+        self.published_pose_count = 0
+        self.dropped_frame_count = 0
 
     # -----------------------------------------------------------------------
     # Publishers
