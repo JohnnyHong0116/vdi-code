@@ -94,6 +94,10 @@ def generate_launch_description():
             package='mmdi',
             executable='natural_handler',
             name='natural_handler',
-            output='screen'
+            output='screen',
+            parameters=[{
+                'max_relative_euler_deg': [25.0, 25.0, 45.0],
+                'max_relative_rotation_deg': 45.0,
+            }]
         ),
     ])

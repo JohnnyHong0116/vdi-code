@@ -10,9 +10,12 @@ tool while staying near the detach pose:
 It can also bias the camera roll so the fused tool +Y direction appears along
 camera +Y after projection into the image/look plane.
 
-The command is constrained to a spherical radius around the detach pose.
+The command is constrained to a spherical radius around the detach pose. The
+tool orientation is also constrained to a detach-relative Euler region and
+maximum total rotation so camera wiring is not driven through excessive twists.
 """
 
+import warnings
 from typing import Optional, Tuple
 
 import numpy as np
@@ -181,6 +184,8 @@ class NaturalHandler(Node):
 
         self.declare_parameter("detach_radius_m", 0.03)
         self.declare_parameter("delta_rot_max", 0.35)
+        self.declare_parameter("max_relative_euler_deg", [25.0, 25.0, 45.0])
+        self.declare_parameter("max_relative_rotation_deg", 45.0)
         self.declare_parameter("maxiter", 60)
         self.declare_parameter("fused_y_alignment_weight", 0.1)
         self.declare_parameter("disable_near_attached_target", True)
@@ -208,6 +213,10 @@ class NaturalHandler(Node):
 
         self.detach_radius_m = float(self.get_parameter("detach_radius_m").value)
         self.delta_rot_max = float(self.get_parameter("delta_rot_max").value)
+        self.max_relative_euler_rad = self._get_euler_limit_parameter()
+        self.max_relative_rotation_rad = np.deg2rad(
+            max(0.0, float(self.get_parameter("max_relative_rotation_deg").value))
+        )
         self.maxiter = int(self.get_parameter("maxiter").value)
         self.fused_y_alignment_weight = float(
             self.get_parameter("fused_y_alignment_weight").value
@@ -268,7 +277,11 @@ class NaturalHandler(Node):
             f"bias camera +y to projected fused +y; "
             f"fused_y_weight={self.fused_y_alignment_weight:.3f}, "
             f"detach_radius={self.detach_radius_m:.3f}m, "
-            f"delta_rot={self.delta_rot_max:.3f}rad"
+            f"delta_rot={self.delta_rot_max:.3f}rad, "
+            f"relative_euler_limit="
+            f"{np.round(np.rad2deg(self.max_relative_euler_rad), 1).tolist()}deg, "
+            f"relative_rotation_limit="
+            f"{np.rad2deg(self.max_relative_rotation_rad):.1f}deg"
         )
         self.get_logger().info(
             f"attached-target guard: enabled={self.disable_near_attached_target}, "
@@ -278,6 +291,18 @@ class NaturalHandler(Node):
 
     def _now_sec(self) -> float:
         return self.get_clock().now().nanoseconds * 1e-9
+
+    def _get_euler_limit_parameter(self) -> np.ndarray:
+        raw = np.asarray(
+            self.get_parameter("max_relative_euler_deg").value,
+            dtype=float,
+        ).reshape(-1)
+        if raw.size != 3:
+            self.get_logger().warn(
+                "max_relative_euler_deg must have 3 values; using default"
+            )
+            raw = np.array([25.0, 25.0, 45.0], dtype=float)
+        return np.deg2rad(np.maximum(raw, 0.0))
 
     def on_mode(self, msg: Int32):
         prev_mode = self.mode
@@ -516,6 +541,7 @@ class NaturalHandler(Node):
     def _build_bounds(
         self,
         curr_pos: np.ndarray,
+        curr_rotvec: np.ndarray,
     ) -> Tuple[np.ndarray, list]:
         anchor_min = self.detach_pos - self.detach_radius_m
         anchor_max = self.detach_pos + self.detach_radius_m
@@ -537,6 +563,7 @@ class NaturalHandler(Node):
         x0 = np.zeros(6, dtype=float)
         if self.detach_pos is not None:
             x0[:3] = self._clamp_to_detach_radius(curr_pos) - curr_pos
+        x0[3:6] = self._initial_rotation_step(curr_rotvec)
         for idx, (low, high) in enumerate(bounds):
             x0[idx] = np.clip(x0[idx], low, high)
         return x0, bounds
@@ -546,6 +573,131 @@ class NaturalHandler(Node):
             return 0.0
         cmd_pos = curr_pos + x[:3]
         return float(self.detach_radius_m - np.linalg.norm(cmd_pos - self.detach_pos))
+
+    def _candidate_tool_rotation(
+        self,
+        x: np.ndarray,
+        curr_rotvec: np.ndarray,
+    ) -> ScipyR:
+        return ScipyR.from_rotvec(x[3:6]) * ScipyR.from_rotvec(curr_rotvec)
+
+    def _relative_rotation_from_detach(self, tool_rot: ScipyR) -> Optional[ScipyR]:
+        if self.detach_rotvec is None:
+            return None
+        return ScipyR.from_rotvec(self.detach_rotvec).inv() * tool_rot
+
+    def _relative_euler_xyz(self, tool_rot: ScipyR) -> Optional[np.ndarray]:
+        relative_rot = self._relative_rotation_from_detach(tool_rot)
+        if relative_rot is None:
+            return None
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", UserWarning)
+            return relative_rot.as_euler("xyz", degrees=False)
+
+    def _relative_euler_constraint(
+        self,
+        x: np.ndarray,
+        curr_rotvec: np.ndarray,
+    ) -> np.ndarray:
+        euler = self._relative_euler_xyz(
+            self._candidate_tool_rotation(x, curr_rotvec)
+        )
+        if euler is None:
+            return np.ones(3, dtype=float)
+        return self.max_relative_euler_rad - np.abs(euler)
+
+    def _relative_rotation_constraint(
+        self,
+        x: np.ndarray,
+        curr_rotvec: np.ndarray,
+    ) -> float:
+        relative_rot = self._relative_rotation_from_detach(
+            self._candidate_tool_rotation(x, curr_rotvec)
+        )
+        if relative_rot is None:
+            return 1.0
+        return float(
+            self.max_relative_rotation_rad
+            - np.linalg.norm(relative_rot.as_rotvec())
+        )
+
+    def _rotation_constraint_margins(self, tool_rot: ScipyR) -> Tuple[np.ndarray, float]:
+        euler = self._relative_euler_xyz(tool_rot)
+        relative_rot = self._relative_rotation_from_detach(tool_rot)
+        if euler is None or relative_rot is None:
+            return np.ones(3, dtype=float), 1.0
+        euler_margin = self.max_relative_euler_rad - np.abs(euler)
+        total_margin = float(
+            self.max_relative_rotation_rad
+            - np.linalg.norm(relative_rot.as_rotvec())
+        )
+        return euler_margin, total_margin
+
+    def _make_rotation_feasible(self, tool_rot: ScipyR) -> ScipyR:
+        relative_rot = self._relative_rotation_from_detach(tool_rot)
+        if relative_rot is None:
+            return tool_rot
+
+        limited_rel = relative_rot
+        for _ in range(2):
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", UserWarning)
+                euler = limited_rel.as_euler("xyz", degrees=False)
+            euler = np.clip(
+                euler,
+                -self.max_relative_euler_rad,
+                self.max_relative_euler_rad,
+            )
+            limited_rel = ScipyR.from_euler("xyz", euler)
+
+            rotvec = limited_rel.as_rotvec()
+            angle = float(np.linalg.norm(rotvec))
+            if self.max_relative_rotation_rad <= 1e-9:
+                limited_rel = ScipyR.identity()
+            elif angle > self.max_relative_rotation_rad:
+                limited_rel = ScipyR.from_rotvec(
+                    rotvec * (self.max_relative_rotation_rad / angle)
+                )
+
+        detach_rot = ScipyR.from_rotvec(self.detach_rotvec)
+        return detach_rot * limited_rel
+
+    def _limit_rotation_step(
+        self,
+        desired_rot: ScipyR,
+        curr_rot: ScipyR,
+    ) -> ScipyR:
+        step_rot = desired_rot * curr_rot.inv()
+        step_rotvec = step_rot.as_rotvec()
+        step_angle = float(np.linalg.norm(step_rotvec))
+        if step_angle <= self.delta_rot_max or self.delta_rot_max <= 1e-9:
+            return desired_rot
+        return (
+            ScipyR.from_rotvec(step_rotvec * (self.delta_rot_max / step_angle))
+            * curr_rot
+        )
+
+    def _initial_rotation_step(self, curr_rotvec: np.ndarray) -> np.ndarray:
+        curr_rot = ScipyR.from_rotvec(curr_rotvec)
+        feasible_rot = self._make_rotation_feasible(curr_rot)
+        limited_rot = self._limit_rotation_step(feasible_rot, curr_rot)
+        return (limited_rot * curr_rot.inv()).as_rotvec()
+
+    def _limit_tool_rotation(
+        self,
+        tool_rot: ScipyR,
+        curr_rotvec: np.ndarray,
+    ) -> ScipyR:
+        feasible_rot = self._make_rotation_feasible(tool_rot)
+        euler_margin, total_margin = self._rotation_constraint_margins(tool_rot)
+        if np.any(euler_margin < -1e-6) or total_margin < -1e-6:
+            self.get_logger().warn(
+                "natural command orientation clamped to detach-relative limits",
+                throttle_duration_sec=1.0,
+            )
+            curr_rot = ScipyR.from_rotvec(curr_rotvec)
+            return self._limit_rotation_step(feasible_rot, curr_rot)
+        return feasible_rot
 
     def _clamp_to_detach_radius(self, pos: np.ndarray) -> np.ndarray:
         if self.detach_pos is None or self.detach_radius_m <= 1e-9:
@@ -572,7 +724,7 @@ class NaturalHandler(Node):
         target_quat: np.ndarray,
         trans_tool_cam,
     ) -> Tuple[np.ndarray, np.ndarray]:
-        x0, bounds = self._build_bounds(curr_pos)
+        x0, bounds = self._build_bounds(curr_pos, curr_rotvec)
 
         try:
             res = minimize(
@@ -594,6 +746,16 @@ class NaturalHandler(Node):
                         "fun": self._detach_radius_constraint,
                         "args": (curr_pos,),
                     },
+                    {
+                        "type": "ineq",
+                        "fun": self._relative_euler_constraint,
+                        "args": (curr_rotvec,),
+                    },
+                    {
+                        "type": "ineq",
+                        "fun": self._relative_rotation_constraint,
+                        "args": (curr_rotvec,),
+                    },
                 ),
                 options={"disp": False, "maxiter": self.maxiter, "ftol": 1e-6},
             )
@@ -607,6 +769,7 @@ class NaturalHandler(Node):
 
         pos = curr_pos + np.asarray(x_opt[:3], dtype=float)
         rot = ScipyR.from_rotvec(x_opt[3:6]) * ScipyR.from_rotvec(curr_rotvec)
+        rot = self._limit_tool_rotation(rot, curr_rotvec)
         quat = rot.as_quat()
         pos = self._clamp_to_detach_radius(pos)
         return pos, quat
@@ -633,7 +796,8 @@ class NaturalHandler(Node):
         self.pose_pub.publish(msg)
 
     def _publish_hold_pose(self, curr_pos: np.ndarray, curr_rotvec: np.ndarray):
-        curr_quat = ScipyR.from_rotvec(curr_rotvec).as_quat()
+        curr_rot = ScipyR.from_rotvec(curr_rotvec)
+        curr_quat = self._limit_tool_rotation(curr_rot, curr_rotvec).as_quat()
         self._publish_target_pose(curr_pos, curr_quat)
 
     def tick(self):
