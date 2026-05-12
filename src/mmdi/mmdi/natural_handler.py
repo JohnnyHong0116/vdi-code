@@ -132,18 +132,18 @@ def camera_alignment_residual(
     target_pos: np.ndarray,
     target_quat: np.ndarray,
     trans_tool_cam,
+    look_weight: float,
     fused_y_weight: float,
+    desired_camera_distance_m: float,
+    distance_weight: float,
+    preferred_side_xy: Optional[np.ndarray],
+    side_offset_m: float,
+    side_weight: float,
+    desired_tool_z_m: float,
+    height_weight: float,
+    motion_weight: float,
+    rotation_motion_weight: float,
 ) -> float:
-    z_residual = camera_z_alignment_residual(
-        x,
-        curr_pos,
-        curr_rotvec,
-        target_pos,
-        trans_tool_cam,
-    )
-    if fused_y_weight <= 0.0:
-        return z_residual
-
     tool_pos = np.asarray(curr_pos, dtype=float) + np.asarray(x[:3], dtype=float)
     tool_rot = ScipyR.from_rotvec(x[3:6]) * ScipyR.from_rotvec(curr_rotvec)
     cam_pos, cam_rot = _camera_pose_from_tool_rotation(
@@ -156,12 +156,51 @@ def camera_alignment_residual(
     if cam_to_target is None:
         return 1e3
 
-    y_residual = camera_fused_y_alignment_residual(
-        cam_to_target,
-        cam_rot,
-        target_quat,
+    z_cam = cam_rot.as_matrix()[:, 2]
+    look_residual = float((np.dot(cam_to_target, z_cam) - 1.0) ** 2)
+
+    dist_residual = 0.0
+    if distance_weight > 0.0:
+        dist = float(np.linalg.norm(target_pos - cam_pos))
+        dist_residual = float((dist - desired_camera_distance_m) ** 2)
+
+    side_residual = 0.0
+    if (
+        side_weight > 0.0
+        and preferred_side_xy is not None
+        and side_offset_m > 0.0
+    ):
+        side_target = np.asarray(target_pos, dtype=float).copy()
+        side_target[:2] += side_offset_m * preferred_side_xy[:2]
+        side_residual = float(np.linalg.norm(tool_pos[:2] - side_target[:2]) ** 2)
+
+    height_residual = 0.0
+    if height_weight > 0.0:
+        height_residual = float((tool_pos[2] - desired_tool_z_m) ** 2)
+
+    roll_residual = 0.0
+    if fused_y_weight > 0.0:
+        roll_residual = camera_fused_y_alignment_residual(
+            cam_to_target,
+            cam_rot,
+            target_quat,
+        )
+
+    motion_residual = 0.0
+    if motion_weight > 0.0:
+        motion_residual = float(
+            np.linalg.norm(x[:3]) ** 2
+            + rotation_motion_weight * np.linalg.norm(x[3:6]) ** 2
+        )
+
+    return float(
+        look_weight * look_residual
+        + distance_weight * dist_residual
+        + side_weight * side_residual
+        + height_weight * height_residual
+        + fused_y_weight * roll_residual
+        + motion_weight * motion_residual
     )
-    return float(z_residual + fused_y_weight * y_residual)
 
 
 class NaturalHandler(Node):
@@ -184,13 +223,25 @@ class NaturalHandler(Node):
         self.declare_parameter("use_tf_target_fallback", True)
 
         self.declare_parameter("delta_pos_max_m", 0.015)
+        self.declare_parameter("internal_bound_radius_m", 0.03)
         self.declare_parameter("delta_rot_max", 0.35)
         self.declare_parameter("max_relative_euler_deg", [25.0, 25.0, 45.0])
         self.declare_parameter("max_relative_rotation_deg", 45.0)
         self.declare_parameter("global_tool_pos_min", [0.18, -0.28, 0.25])
         self.declare_parameter("global_tool_pos_max", [0.38, 0.28, 0.45])
         self.declare_parameter("maxiter", 60)
+        self.declare_parameter("look_alignment_weight", 100.0)
+        self.declare_parameter("desired_camera_distance_m", 0.30)
+        self.declare_parameter("camera_distance_weight", 20.0)
+        self.declare_parameter("side_offset_m", 0.20)
+        self.declare_parameter("side_preference_weight", 10.0)
+        self.declare_parameter("side_axis_sign", 1.0)
+        self.declare_parameter("side_deadband", 0.15)
+        self.declare_parameter("desired_tool_z_m", 0.35)
+        self.declare_parameter("tool_height_weight", 2.0)
         self.declare_parameter("fused_y_alignment_weight", 0.1)
+        self.declare_parameter("motion_weight", 1.0)
+        self.declare_parameter("rotation_motion_weight", 0.1)
         self.declare_parameter("disable_near_attached_target", True)
         self.declare_parameter("attached_target_camera_pos", [0.029, -0.025, 0.159])
         self.declare_parameter("attached_target_camera_radius_m", 0.04)
@@ -218,6 +269,10 @@ class NaturalHandler(Node):
             0.0,
             float(self.get_parameter("delta_pos_max_m").value),
         )
+        self.internal_bound_radius_m = max(
+            0.0,
+            float(self.get_parameter("internal_bound_radius_m").value),
+        )
         self.delta_rot_max = float(self.get_parameter("delta_rot_max").value)
         self.max_relative_euler_rad = self._get_euler_limit_parameter()
         self.max_relative_rotation_rad = np.deg2rad(
@@ -232,8 +287,48 @@ class NaturalHandler(Node):
             [0.38, 0.28, 0.45],
         )
         self.maxiter = int(self.get_parameter("maxiter").value)
+        self.look_alignment_weight = max(
+            0.0,
+            float(self.get_parameter("look_alignment_weight").value),
+        )
+        self.desired_camera_distance_m = max(
+            0.0,
+            float(self.get_parameter("desired_camera_distance_m").value),
+        )
+        self.camera_distance_weight = max(
+            0.0,
+            float(self.get_parameter("camera_distance_weight").value),
+        )
+        self.side_offset_m = max(
+            0.0,
+            float(self.get_parameter("side_offset_m").value),
+        )
+        self.side_preference_weight = max(
+            0.0,
+            float(self.get_parameter("side_preference_weight").value),
+        )
+        self.side_axis_sign = 1.0 if float(
+            self.get_parameter("side_axis_sign").value
+        ) >= 0.0 else -1.0
+        self.side_deadband = max(
+            0.0,
+            float(self.get_parameter("side_deadband").value),
+        )
+        self.desired_tool_z_m = float(self.get_parameter("desired_tool_z_m").value)
+        self.tool_height_weight = max(
+            0.0,
+            float(self.get_parameter("tool_height_weight").value),
+        )
         self.fused_y_alignment_weight = float(
             self.get_parameter("fused_y_alignment_weight").value
+        )
+        self.motion_weight = max(
+            0.0,
+            float(self.get_parameter("motion_weight").value),
+        )
+        self.rotation_motion_weight = max(
+            0.0,
+            float(self.get_parameter("rotation_motion_weight").value),
         )
         self.disable_near_attached_target = bool(
             self.get_parameter("disable_near_attached_target").value
@@ -261,6 +356,8 @@ class NaturalHandler(Node):
         self.detach_pos = None
         self.detach_rotvec = None
         self.detach_camera_pos = None
+        self.preferred_side_xy = None
+        self.last_side_log_sec = None
 
         self.target_pos = None
         self.target_quat = None
@@ -288,14 +385,26 @@ class NaturalHandler(Node):
         )
         self.get_logger().info(
             f"objective: align camera +z to fused tool, "
+            f"bias global side opposite fused +y, "
             f"bias camera +y to projected fused +y; "
+            f"look_weight={self.look_alignment_weight:.3f}, "
+            f"distance_weight={self.camera_distance_weight:.3f}, "
+            f"side_weight={self.side_preference_weight:.3f}, "
+            f"height_weight={self.tool_height_weight:.3f}, "
             f"fused_y_weight={self.fused_y_alignment_weight:.3f}, "
             f"delta_pos={self.delta_pos_max_m:.3f}m, "
+            f"internal_radius={self.internal_bound_radius_m:.3f}m, "
             f"delta_rot={self.delta_rot_max:.3f}rad, "
             f"relative_euler_limit="
             f"{np.round(np.rad2deg(self.max_relative_euler_rad), 1).tolist()}deg, "
             f"relative_rotation_limit="
             f"{np.rad2deg(self.max_relative_rotation_rad):.1f}deg"
+        )
+        self.get_logger().info(
+            f"side preference: offset={self.side_offset_m:.3f}m, "
+            f"axis_sign={self.side_axis_sign:.0f}, "
+            f"deadband={self.side_deadband:.3f}, "
+            f"desired_z={self.desired_tool_z_m:.3f}m"
         )
         self.get_logger().info(
             f"global tool bounds: "
@@ -351,6 +460,8 @@ class NaturalHandler(Node):
         self.detach_pos = None
         self.detach_rotvec = None
         self.detach_camera_pos = None
+        self.preferred_side_xy = None
+        self.last_side_log_sec = None
 
     def on_fused_pose(self, msg: PoseWithCovarianceStamped):
         frame_id = msg.header.frame_id if msg.header.frame_id else self.base_frame
@@ -607,6 +718,64 @@ class NaturalHandler(Node):
             x0[idx] = np.clip(x0[idx], low, high)
         return x0, bounds
 
+    def _internal_position_constraint(self, x: np.ndarray) -> float:
+        if self.internal_bound_radius_m <= 1e-9:
+            return 1.0
+        return float(self.internal_bound_radius_m - np.linalg.norm(x[:3]))
+
+    def _preferred_side_from_target(
+        self,
+        target_quat: np.ndarray,
+    ) -> Optional[np.ndarray]:
+        if self.side_preference_weight <= 0.0 or self.side_offset_m <= 0.0:
+            return None
+
+        r_target = ScipyR.from_quat(target_quat)
+        tool_y = r_target.as_matrix()[:, 1]
+        tool_y_xy = np.array([tool_y[0], tool_y[1], 0.0], dtype=float)
+        norm = float(np.linalg.norm(tool_y_xy[:2]))
+
+        if norm < self.side_deadband:
+            if self.preferred_side_xy is None:
+                return None
+            return self.preferred_side_xy.copy()
+
+        preferred = -self.side_axis_sign * (tool_y_xy / norm)
+        if (
+            self.preferred_side_xy is not None
+            and np.dot(preferred, self.preferred_side_xy) < -0.25
+        ):
+            self.get_logger().info(
+                f"natural side preference flipped: "
+                f"{np.round(self.preferred_side_xy[:2], 3).tolist()} -> "
+                f"{np.round(preferred[:2], 3).tolist()}",
+                throttle_duration_sec=0.5,
+            )
+        self.preferred_side_xy = preferred
+        return preferred.copy()
+
+    def _log_side_preference(
+        self,
+        preferred_side_xy: Optional[np.ndarray],
+        target_pos: np.ndarray,
+    ):
+        if preferred_side_xy is None:
+            return
+        now = self._now_sec()
+        if (
+            self.last_side_log_sec is not None
+            and now - self.last_side_log_sec < 1.0
+        ):
+            return
+        self.last_side_log_sec = now
+        side_target = np.asarray(target_pos, dtype=float).copy()
+        side_target[:2] += self.side_offset_m * preferred_side_xy[:2]
+        self.get_logger().info(
+            f"natural side target: "
+            f"side={np.round(preferred_side_xy[:2], 3).tolist()}, "
+            f"target_xy={np.round(side_target[:2], 3).tolist()}"
+        )
+
     def _candidate_tool_rotation(
         self,
         x: np.ndarray,
@@ -756,7 +925,14 @@ class NaturalHandler(Node):
         trans_tool_cam,
     ) -> Tuple[np.ndarray, np.ndarray]:
         x0, bounds = self._build_bounds(curr_pos, curr_rotvec)
+        preferred_side_xy = self._preferred_side_from_target(target_quat)
+        self._log_side_preference(preferred_side_xy, target_pos)
+
         constraints = [
+            {
+                "type": "ineq",
+                "fun": self._internal_position_constraint,
+            },
             {
                 "type": "ineq",
                 "fun": self._relative_euler_constraint,
@@ -779,7 +955,17 @@ class NaturalHandler(Node):
                     target_pos,
                     target_quat,
                     trans_tool_cam,
+                    self.look_alignment_weight,
                     self.fused_y_alignment_weight,
+                    self.desired_camera_distance_m,
+                    self.camera_distance_weight,
+                    preferred_side_xy,
+                    self.side_offset_m,
+                    self.side_preference_weight,
+                    self.desired_tool_z_m,
+                    self.tool_height_weight,
+                    self.motion_weight,
+                    self.rotation_motion_weight,
                 ),
                 method="SLSQP",
                 bounds=bounds,
