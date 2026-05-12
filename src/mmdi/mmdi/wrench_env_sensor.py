@@ -24,8 +24,9 @@ class WrenchEnvSensor(Node):
         self.declare_parameter("sensor_port", 49152)
         self.declare_parameter("base_frame", "base")
         self.declare_parameter("tool_frame", "tool0")
-        self.declare_parameter("output_topic", "/ur7e/ft_env_sensor")
+        self.declare_parameter("output_topic", "/ur7e/ft_env_sensor_raw")
         self.declare_parameter("rate_hz", 100.0)
+        self.declare_parameter("tare_on_startup", False)
 
         self.sensor_ip = str(self.get_parameter("sensor_ip").value)
         self.sensor_port = int(self.get_parameter("sensor_port").value)
@@ -33,6 +34,7 @@ class WrenchEnvSensor(Node):
         self.tool_frame = str(self.get_parameter("tool_frame").value)
         self.output_topic = str(self.get_parameter("output_topic").value)
         self.rate_hz = float(self.get_parameter("rate_hz").value)
+        self.tare_on_startup = bool(self.get_parameter("tare_on_startup").value)
 
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 8192)
@@ -128,13 +130,14 @@ class WrenchEnvSensor(Node):
 
         force_s, torque_s = sample
 
-        if self.bias_enabled:
-            force_s = force_s - self.force_bias
-            torque_s = torque_s - self.torque_bias
-        else:
-            self.force_bias = force_s.copy()
-            self.torque_bias = torque_s.copy()
-            self.bias_enabled = True
+        if self.tare_on_startup:
+            if self.bias_enabled:
+                force_s = force_s - self.force_bias
+                torque_s = torque_s - self.torque_bias
+            else:
+                self.force_bias = force_s.copy()
+                self.torque_bias = torque_s.copy()
+                self.bias_enabled = True
 
         force_tool = self.R_ftmini_to_tool.apply(force_s)
         torque_tool = self.R_ftmini_to_tool.apply(torque_s)

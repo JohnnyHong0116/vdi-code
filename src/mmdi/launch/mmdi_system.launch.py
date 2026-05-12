@@ -14,7 +14,28 @@ def generate_launch_description():
             package='mmdi',
             executable='arduino_handler',
             name='arduino_handler',
-            output='screen'
+            output='screen',
+            parameters=[{
+                'initial_led_state': 'a',
+            }]
+        ),
+
+        # Startup FT calibration gate. Blocks mode/control until internal and
+        # external FT biases are estimated with the tool attached.
+        Node(
+            package='mmdi',
+            executable='ft_calibrator',
+            name='ft_calibrator',
+            output='screen',
+            parameters=[{
+                'internal_raw_topic': '/force_torque_sensor_broadcaster/wrench',
+                'internal_output_topic': '/ur7e/ft_internal_calibrated',
+                'external_raw_topic': '/ur7e/ft_env_sensor_raw',
+                'external_output_topic': '/ur7e/ft_env_sensor',
+                'sample_count': 200,
+                'external_required': True,
+                'require_tool_attached': True,
+            }]
         ),
 
         # Mode handler node
@@ -22,7 +43,12 @@ def generate_launch_description():
             package='mmdi',
             executable='mode_handler',
             name='mode_handler',
-            output='screen'
+            output='screen',
+            parameters=[{
+                'calibration_required': True,
+                'wrench_topic': '/ur7e/ft_internal_calibrated',
+                'wrench_tare_samples': 0,
+            }]
         ),
 
         # Probe tracker (replaces usb_cam + aruco_opencv + april_state_aggregator + EKF)

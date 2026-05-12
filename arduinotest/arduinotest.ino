@@ -10,14 +10,19 @@ const unsigned long STROBE_PERIOD_MS = 200;
 const unsigned long BLUE_PULSE_PERIOD_MS = 120;
 const uint8_t BLUE_PULSE_LEVELS[] = {40, 80, 130, 180, 230, 255, 230, 180, 130, 80};
 const uint8_t BLUE_PULSE_COUNT = sizeof(BLUE_PULSE_LEVELS) / sizeof(BLUE_PULSE_LEVELS[0]);
+const unsigned long RED_PULSE_PERIOD_MS = 120;
+const uint8_t RED_PULSE_LEVELS[] = {30, 60, 100, 150, 205, 255, 205, 150, 100, 60};
+const uint8_t RED_PULSE_COUNT = sizeof(RED_PULSE_LEVELS) / sizeof(RED_PULSE_LEVELS[0]);
 
 Adafruit_NeoPixel strip(NUM_LEDS, LED_PIN, NEO_GRB + NEO_KHZ800);
 char currentCommand = '\0';
 unsigned long lastReportMs = 0;
 unsigned long lastStrobeToggleMs = 0;
 unsigned long lastBluePulseMs = 0;
+unsigned long lastRedPulseMs = 0;
 bool strobeOn = false;
 uint8_t bluePulseIndex = 0;
+uint8_t redPulseIndex = 0;
 
 void setAll(uint8_t r, uint8_t g, uint8_t b) {
   for (int i = 0; i < NUM_LEDS; i++) {
@@ -60,6 +65,13 @@ void applyCommand(char cmd, bool attached) {
         bluePulseIndex = (bluePulseIndex + 1) % BLUE_PULSE_COUNT;
       }
       setAll(0, 0, BLUE_PULSE_LEVELS[bluePulseIndex]);
+      break;
+    case 'a':
+      if (millis() - lastRedPulseMs >= RED_PULSE_PERIOD_MS) {
+        lastRedPulseMs = millis();
+        redPulseIndex = (redPulseIndex + 1) % RED_PULSE_COUNT;
+      }
+      setAll(RED_PULSE_LEVELS[redPulseIndex], 0, 0);
       break;
     default:
       if (attached) {

@@ -61,6 +61,10 @@ def generate_launch_description():
             executable="wrench_env_sensor",
             name="wrench_env_sensor",
             output="screen",
+            parameters=[{
+                "output_topic": "/ur7e/ft_env_sensor_raw",
+                "tare_on_startup": False,
+            }],
         ),
         IncludeLaunchDescription(
             mmdi_launch,
