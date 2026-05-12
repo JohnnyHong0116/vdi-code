@@ -31,6 +31,7 @@ from rclpy.node import Node
 from nav_msgs.msg import Odometry
 from sensor_msgs.msg import CameraInfo, Image
 from geometry_msgs.msg import TransformStamped
+from std_msgs.msg import Bool
 from tf2_ros import TransformBroadcaster
 from visualization_msgs.msg import Marker, MarkerArray
 from cv_bridge import CvBridge
@@ -337,6 +338,7 @@ class ProbeTracker(Node):
         self.declare_parameter('viz_frame', 'head_camera')
         self.declare_parameter('markers_topic', '/probe_tracker/markers')
         self.declare_parameter('camera_info_topic', '/probe_tracker/camera_info')
+        self.declare_parameter('target_visible_topic', '/probe_tracker/target_visible')
         self.declare_parameter('marker_lifetime_s', 0.25)
         self.declare_parameter('debug_publish_hz', 30.0)
         self.declare_parameter('marker_publish_hz', 30.0)
@@ -427,6 +429,7 @@ class ProbeTracker(Node):
         self.viz_frame = self.get_parameter('viz_frame').value
         self.markers_topic = self.get_parameter('markers_topic').value
         self.camera_info_topic = self.get_parameter('camera_info_topic').value
+        self.target_visible_topic = self.get_parameter('target_visible_topic').value
         self.marker_lifetime = Duration(
             seconds=float(self.get_parameter('marker_lifetime_s').value)
         ).to_msg()
@@ -462,6 +465,8 @@ class ProbeTracker(Node):
             CameraInfo, self.camera_info_topic, 10)
         self.marker_pub = self.create_publisher(
             MarkerArray, self.markers_topic, 10)
+        self.target_visible_pub = self.create_publisher(
+            Bool, self.target_visible_topic, 10)
         self.bridge = CvBridge()
 
         # ---- Particle filter ------------------------------------------------
@@ -986,6 +991,7 @@ class ProbeTracker(Node):
                     self.prev_velocity = raw_vel
                 self.last_measurement_time = now_sec
         filter_ms = (time.perf_counter() - filter_start) * 1000.0
+        self.target_visible_pub.publish(Bool(data=bool(fusion_tag_ids)))
 
         if fused_pos is not None and self.prediction_lead_s > 0.0:
             fused_pos = fused_pos + (self.prev_velocity * self.prediction_lead_s)

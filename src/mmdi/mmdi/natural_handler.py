@@ -27,7 +27,7 @@ from rclpy.node import Node
 from rclpy.time import Time
 from scipy.optimize import minimize
 from scipy.spatial.transform import Rotation as ScipyR
-from std_msgs.msg import Int32
+from std_msgs.msg import Bool, Int32
 from tf2_ros import Buffer, TransformListener
 
 NATURAL_MODE = 3
@@ -134,7 +134,8 @@ def camera_alignment_residual(
     trans_tool_cam,
     look_weight: float,
     fused_y_weight: float,
-    desired_camera_distance_m: float,
+    camera_distance_min_m: float,
+    camera_distance_max_m: float,
     distance_weight: float,
     preferred_side_xy: Optional[np.ndarray],
     side_offset_m: float,
@@ -162,7 +163,10 @@ def camera_alignment_residual(
     dist_residual = 0.0
     if distance_weight > 0.0:
         dist = float(np.linalg.norm(target_pos - cam_pos))
-        dist_residual = float((dist - desired_camera_distance_m) ** 2)
+        if dist < camera_distance_min_m:
+            dist_residual = float((camera_distance_min_m - dist) ** 2)
+        elif dist > camera_distance_max_m:
+            dist_residual = float((dist - camera_distance_max_m) ** 2)
 
     side_residual = 0.0
     if (
@@ -209,6 +213,12 @@ class NaturalHandler(Node):
 
         self.declare_parameter("mode_topic", "/mode")
         self.declare_parameter("target_pose_topic", "/ur7e/target_pose")
+        self.declare_parameter(
+            "optimizing_active_topic",
+            "/natural_handler/optimizing_active",
+        )
+        self.declare_parameter("target_lost_topic", "/natural_handler/target_lost")
+        self.declare_parameter("target_visible_topic", "/probe_tracker/target_visible")
         self.declare_parameter("fused_pose_topic", "/ur7e/fused_tool_pose")
         self.declare_parameter("fused_odom_topic", "/vo")
 
@@ -227,27 +237,40 @@ class NaturalHandler(Node):
         self.declare_parameter("delta_rot_max", 0.35)
         self.declare_parameter("max_relative_euler_deg", [25.0, 25.0, 45.0])
         self.declare_parameter("max_relative_rotation_deg", 45.0)
-        self.declare_parameter("global_tool_pos_min", [0.18, -0.28, 0.25])
-        self.declare_parameter("global_tool_pos_max", [0.38, 0.28, 0.45])
+        self.declare_parameter("global_tool_pos_min", [0.09, -0.43, 0.24])
+        self.declare_parameter("global_tool_pos_max", [0.64, 0.44, 0.49])
         self.declare_parameter("maxiter", 60)
         self.declare_parameter("look_alignment_weight", 100.0)
-        self.declare_parameter("desired_camera_distance_m", 0.30)
+        self.declare_parameter("camera_distance_min_m", 0.25)
+        self.declare_parameter("camera_distance_max_m", 0.35)
         self.declare_parameter("camera_distance_weight", 20.0)
         self.declare_parameter("side_offset_m", 0.20)
         self.declare_parameter("side_preference_weight", 10.0)
-        self.declare_parameter("side_axis_sign", 1.0)
+        self.declare_parameter("side_axis_sign", -1.0)
         self.declare_parameter("side_deadband", 0.15)
         self.declare_parameter("desired_tool_z_m", 0.35)
         self.declare_parameter("tool_height_weight", 2.0)
         self.declare_parameter("fused_y_alignment_weight", 0.1)
         self.declare_parameter("motion_weight", 1.0)
         self.declare_parameter("rotation_motion_weight", 0.1)
+        self.declare_parameter("command_translation_deadband_m", 0.004)
+        self.declare_parameter("command_rotation_deadband_rad", 0.035)
+        self.declare_parameter("search_yaw_amplitude_rad", 0.35)
+        self.declare_parameter("search_yaw_frequency_hz", 0.25)
+        self.declare_parameter("search_yaw_axis_sign", 1.0)
         self.declare_parameter("disable_near_attached_target", True)
         self.declare_parameter("attached_target_camera_pos", [0.029, -0.025, 0.159])
         self.declare_parameter("attached_target_camera_radius_m", 0.04)
 
         self.mode_topic = str(self.get_parameter("mode_topic").value)
         self.target_pose_topic = str(self.get_parameter("target_pose_topic").value)
+        self.optimizing_active_topic = str(
+            self.get_parameter("optimizing_active_topic").value
+        )
+        self.target_lost_topic = str(self.get_parameter("target_lost_topic").value)
+        self.target_visible_topic = str(
+            self.get_parameter("target_visible_topic").value
+        )
         self.fused_pose_topic = str(self.get_parameter("fused_pose_topic").value)
         self.fused_odom_topic = str(self.get_parameter("fused_odom_topic").value)
 
@@ -280,20 +303,24 @@ class NaturalHandler(Node):
         )
         self.global_tool_pos_min = self._get_vector_parameter(
             "global_tool_pos_min",
-            [0.18, -0.28, 0.25],
+            [0.09, -0.43, 0.24],
         )
         self.global_tool_pos_max = self._get_vector_parameter(
             "global_tool_pos_max",
-            [0.38, 0.28, 0.45],
+            [0.64, 0.44, 0.49],
         )
         self.maxiter = int(self.get_parameter("maxiter").value)
         self.look_alignment_weight = max(
             0.0,
             float(self.get_parameter("look_alignment_weight").value),
         )
-        self.desired_camera_distance_m = max(
+        self.camera_distance_min_m = max(
             0.0,
-            float(self.get_parameter("desired_camera_distance_m").value),
+            float(self.get_parameter("camera_distance_min_m").value),
+        )
+        self.camera_distance_max_m = max(
+            self.camera_distance_min_m,
+            float(self.get_parameter("camera_distance_max_m").value),
         )
         self.camera_distance_weight = max(
             0.0,
@@ -330,6 +357,25 @@ class NaturalHandler(Node):
             0.0,
             float(self.get_parameter("rotation_motion_weight").value),
         )
+        self.command_translation_deadband_m = max(
+            0.0,
+            float(self.get_parameter("command_translation_deadband_m").value),
+        )
+        self.command_rotation_deadband_rad = max(
+            0.0,
+            float(self.get_parameter("command_rotation_deadband_rad").value),
+        )
+        self.search_yaw_amplitude_rad = max(
+            0.0,
+            float(self.get_parameter("search_yaw_amplitude_rad").value),
+        )
+        self.search_yaw_frequency_hz = max(
+            0.0,
+            float(self.get_parameter("search_yaw_frequency_hz").value),
+        )
+        self.search_yaw_axis_sign = 1.0 if float(
+            self.get_parameter("search_yaw_axis_sign").value
+        ) >= 0.0 else -1.0
         self.disable_near_attached_target = bool(
             self.get_parameter("disable_near_attached_target").value
         )
@@ -358,16 +404,35 @@ class NaturalHandler(Node):
         self.detach_camera_pos = None
         self.preferred_side_xy = None
         self.last_side_log_sec = None
+        self.last_command_pos = None
+        self.last_command_quat = None
+        self.search_start_sec = None
+        self.search_center_pos = None
+        self.search_center_rotvec = None
+        self.search_initial_direction = 1.0
 
         self.target_pos = None
         self.target_quat = None
         self.last_target_update_sec = None
+        self.target_visible = False
+        self.last_target_visible_sec = None
         self.target_camera_pos = None
         self.last_target_camera_update_sec = None
 
         self.pose_pub = self.create_publisher(PoseStamped, self.target_pose_topic, 1)
+        self.optimizing_pub = self.create_publisher(
+            Bool,
+            self.optimizing_active_topic,
+            10,
+        )
+        self.target_lost_pub = self.create_publisher(
+            Bool,
+            self.target_lost_topic,
+            10,
+        )
 
         self.create_subscription(Int32, self.mode_topic, self.on_mode, 10)
+        self.create_subscription(Bool, self.target_visible_topic, self.on_target_visible, 10)
         self.create_subscription(
             PoseWithCovarianceStamped,
             self.fused_pose_topic,
@@ -385,14 +450,20 @@ class NaturalHandler(Node):
         )
         self.get_logger().info(
             f"objective: align camera +z to fused tool, "
-            f"bias global side opposite fused +y, "
+            f"bias global side using signed fused +y, "
             f"bias camera +y to projected fused +y; "
             f"look_weight={self.look_alignment_weight:.3f}, "
+            f"distance_band=[{self.camera_distance_min_m:.3f}, "
+            f"{self.camera_distance_max_m:.3f}]m, "
             f"distance_weight={self.camera_distance_weight:.3f}, "
             f"side_weight={self.side_preference_weight:.3f}, "
             f"height_weight={self.tool_height_weight:.3f}, "
             f"fused_y_weight={self.fused_y_alignment_weight:.3f}, "
             f"delta_pos={self.delta_pos_max_m:.3f}m, "
+            f"command_deadband={self.command_translation_deadband_m:.3f}m/"
+            f"{self.command_rotation_deadband_rad:.3f}rad, "
+            f"search_yaw={self.search_yaw_amplitude_rad:.3f}rad@"
+            f"{self.search_yaw_frequency_hz:.2f}Hz, "
             f"internal_radius={self.internal_bound_radius_m:.3f}m, "
             f"delta_rot={self.delta_rot_max:.3f}rad, "
             f"relative_euler_limit="
@@ -454,6 +525,8 @@ class NaturalHandler(Node):
                 curr_pos, curr_rotvec, _ = tool_state
                 curr_quat = ScipyR.from_rotvec(curr_rotvec).as_quat()
                 self._publish_target_pose(curr_pos, curr_quat, clamp=False)
+            self._publish_optimizing_active(False)
+            self._publish_target_lost(False)
             self._reset_natural_state()
 
     def _reset_natural_state(self):
@@ -462,6 +535,20 @@ class NaturalHandler(Node):
         self.detach_camera_pos = None
         self.preferred_side_xy = None
         self.last_side_log_sec = None
+        self.last_command_pos = None
+        self.last_command_quat = None
+        self.search_start_sec = None
+        self.search_center_pos = None
+        self.search_center_rotvec = None
+        self.search_initial_direction = 1.0
+
+    def on_target_visible(self, msg: Bool):
+        self.target_visible = bool(msg.data)
+        self.last_target_visible_sec = self._now_sec()
+        if self.target_visible:
+            self.search_start_sec = None
+            self.search_center_pos = None
+            self.search_center_rotvec = None
 
     def on_fused_pose(self, msg: PoseWithCovarianceStamped):
         frame_id = msg.header.frame_id if msg.header.frame_id else self.base_frame
@@ -523,6 +610,11 @@ class NaturalHandler(Node):
         self.target_pos = pos.copy()
         self.target_quat = quat.copy()
         self.last_target_update_sec = stamp_sec
+
+    def _target_visible_active(self) -> bool:
+        if not self.target_visible or self.last_target_visible_sec is None:
+            return False
+        return (self._now_sec() - self.last_target_visible_sec) <= self.target_timeout_sec
 
     def _update_target_camera_pos(self, pos: np.ndarray, stamp_sec: float):
         if not np.isfinite(pos).all():
@@ -916,6 +1008,71 @@ class NaturalHandler(Node):
             )
         return clamped
 
+    def _command_change_exceeds_deadband(
+        self,
+        curr_pos: np.ndarray,
+        curr_rotvec: np.ndarray,
+        new_pos: np.ndarray,
+        new_quat: np.ndarray,
+    ) -> bool:
+        ref_pos = curr_pos if self.last_command_pos is None else self.last_command_pos
+        ref_quat = (
+            ScipyR.from_rotvec(curr_rotvec).as_quat()
+            if self.last_command_quat is None
+            else self.last_command_quat
+        )
+        linear_step = float(np.linalg.norm(np.asarray(new_pos) - np.asarray(ref_pos)))
+        ref_rot = ScipyR.from_quat(ref_quat)
+        new_rot = ScipyR.from_quat(new_quat)
+        angular_step = float(np.linalg.norm((new_rot * ref_rot.inv()).as_rotvec()))
+        return (
+            linear_step >= self.command_translation_deadband_m
+            or angular_step >= self.command_rotation_deadband_rad
+        )
+
+    def _publish_optimizing_active(self, active: bool):
+        msg = Bool()
+        msg.data = bool(active)
+        self.optimizing_pub.publish(msg)
+
+    def _publish_target_lost(self, lost: bool):
+        msg = Bool()
+        msg.data = bool(lost)
+        self.target_lost_pub.publish(msg)
+
+    def _search_direction_from_position(self, curr_pos: np.ndarray) -> float:
+        y_center = 0.5 * (self.global_tool_pos_min[1] + self.global_tool_pos_max[1])
+        if curr_pos[1] > y_center:
+            return -1.0
+        return 1.0
+
+    def _publish_search_pose(self, curr_pos: np.ndarray, curr_rotvec: np.ndarray):
+        now_sec = self._now_sec()
+        if (
+            self.search_start_sec is None
+            or self.search_center_pos is None
+            or self.search_center_rotvec is None
+        ):
+            self.search_start_sec = now_sec
+            self.search_center_pos = curr_pos.copy()
+            self.search_center_rotvec = curr_rotvec.copy()
+            self.search_initial_direction = self._search_direction_from_position(curr_pos)
+
+        elapsed = max(0.0, now_sec - self.search_start_sec)
+        phase = 2.0 * np.pi * self.search_yaw_frequency_hz * elapsed
+        yaw = (
+            self.search_yaw_axis_sign
+            * self.search_initial_direction
+            * self.search_yaw_amplitude_rad
+            * np.sin(phase)
+        )
+        center_rot = ScipyR.from_rotvec(self.search_center_rotvec)
+        search_rot = ScipyR.from_rotvec(np.array([0.0, 0.0, yaw])) * center_rot
+        search_rot = self._limit_tool_rotation(search_rot, curr_rotvec)
+        self._publish_target_pose(self.search_center_pos, search_rot.as_quat())
+        self._publish_optimizing_active(False)
+        self._publish_target_lost(True)
+
     def optimize_pose(
         self,
         curr_pos: np.ndarray,
@@ -957,7 +1114,8 @@ class NaturalHandler(Node):
                     trans_tool_cam,
                     self.look_alignment_weight,
                     self.fused_y_alignment_weight,
-                    self.desired_camera_distance_m,
+                    self.camera_distance_min_m,
+                    self.camera_distance_max_m,
                     self.camera_distance_weight,
                     preferred_side_xy,
                     self.side_offset_m,
@@ -1007,11 +1165,14 @@ class NaturalHandler(Node):
         msg.pose.orientation.z = float(quat[2])
         msg.pose.orientation.w = float(quat[3])
         self.pose_pub.publish(msg)
+        self.last_command_pos = np.asarray(pos, dtype=float).copy()
+        self.last_command_quat = np.asarray(quat, dtype=float).copy()
 
     def _publish_hold_pose(self, curr_pos: np.ndarray, curr_rotvec: np.ndarray):
         curr_rot = ScipyR.from_rotvec(curr_rotvec)
         curr_quat = self._limit_tool_rotation(curr_rot, curr_rotvec).as_quat()
         self._publish_target_pose(curr_pos, curr_quat)
+        self._publish_optimizing_active(False)
 
     def tick(self):
         if self.mode != NATURAL_MODE:
@@ -1023,22 +1184,28 @@ class NaturalHandler(Node):
         curr_pos, curr_rotvec, trans_tool_cam = tool_state
 
         target_state = self._get_active_target_pose()
-        if target_state is None:
-            self._publish_hold_pose(curr_pos, curr_rotvec)
+        if target_state is None or not self._target_visible_active():
+            self._publish_search_pose(curr_pos, curr_rotvec)
             return
 
         if self._target_near_attached_pose():
+            self._publish_target_lost(False)
             self._publish_hold_pose(curr_pos, curr_rotvec)
             return
 
         target_pos, target_quat, stale_age = target_state
         if stale_age > self.hard_stale_sec:
-            self._publish_hold_pose(curr_pos, curr_rotvec)
+            self._publish_search_pose(curr_pos, curr_rotvec)
             self.get_logger().warn(
                 f"target stale for {stale_age:.2f}s; skipping command",
                 throttle_duration_sec=1.0,
             )
             return
+
+        self._publish_target_lost(False)
+        self.search_start_sec = None
+        self.search_center_pos = None
+        self.search_center_rotvec = None
 
         new_pos, new_quat = self.optimize_pose(
             curr_pos,
@@ -1047,7 +1214,11 @@ class NaturalHandler(Node):
             target_quat,
             trans_tool_cam,
         )
-        self._publish_target_pose(new_pos, new_quat)
+        if self._command_change_exceeds_deadband(curr_pos, curr_rotvec, new_pos, new_quat):
+            self._publish_target_pose(new_pos, new_quat)
+            self._publish_optimizing_active(True)
+        else:
+            self._publish_optimizing_active(False)
 
 
 def main(args=None):

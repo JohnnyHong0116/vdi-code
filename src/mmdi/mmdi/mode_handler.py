@@ -7,7 +7,7 @@ MODE DESCRIPTION:
  0: idle (red)
  1: teleop (green)
  2: kinesthetic (yellow)
- 3: natural demonstration (blue)
+ 3: natural demonstration (blue, pulsing blue while optimizing, red when lost)
 """
 
 import numpy as np
@@ -32,6 +32,15 @@ class ModeHandler(Node):
     def __init__(self):
         super().__init__('mode_handler')
         self.declare_parameter('spacemouse_input_topic', '/ur7e/teleop_active')
+        self.declare_parameter(
+            'natural_optimizing_topic',
+            '/natural_handler/optimizing_active',
+        )
+        self.declare_parameter(
+            'natural_target_lost_topic',
+            '/natural_handler/target_lost',
+        )
+        self.declare_parameter('natural_optimizing_timeout_s', 0.6)
         self.declare_parameter('external_force_topic', '/uniforce/force')
         self.declare_parameter('wrench_topic', '/force_torque_sensor_broadcaster/wrench')
         self.declare_parameter('env_wrench_topic', '/ur7e/ft_env_sensor')
@@ -48,6 +57,15 @@ class ModeHandler(Node):
         self.declare_parameter('wrench_tare_samples', 50)
         self.declare_parameter('enable_freedrive_controller_topic', False)
         self.spacemouse_input_topic = self.get_parameter('spacemouse_input_topic').value
+        self.natural_optimizing_topic = self.get_parameter(
+            'natural_optimizing_topic'
+        ).value
+        self.natural_target_lost_topic = self.get_parameter(
+            'natural_target_lost_topic'
+        ).value
+        self.natural_optimizing_timeout_s = float(
+            self.get_parameter('natural_optimizing_timeout_s').value
+        )
         self.external_force_topic = self.get_parameter('external_force_topic').value
         self.wrench_topic = self.get_parameter('wrench_topic').value
         self.env_wrench_topic = self.get_parameter('env_wrench_topic').value
@@ -109,6 +127,10 @@ class ModeHandler(Node):
         self.wrench_is_tared = (self.wrench_tare_samples == 0)
         self.kinesthetic_request_start = None
         self.kinesthetic_entry_armed_after_hold = False
+        self.natural_optimizing = False
+        self.last_natural_optimizing_sec = None
+        self.natural_target_lost = False
+        self.last_natural_target_lost_sec = None
 
         # Publishers
         self.led_pub = self.create_publisher(String, '/led_state', 10)
@@ -120,6 +142,18 @@ class ModeHandler(Node):
             Int32, '/tool_contact', self.store_tool_contact, 10)
         self.sm_sub = self.create_subscription(
             Bool, self.spacemouse_input_topic, self.store_curr_sm, 10)
+        self.natural_optimizing_sub = self.create_subscription(
+            Bool,
+            self.natural_optimizing_topic,
+            self.store_natural_optimizing,
+            10,
+        )
+        self.natural_target_lost_sub = self.create_subscription(
+            Bool,
+            self.natural_target_lost_topic,
+            self.store_natural_target_lost,
+            10,
+        )
         self.uniforce_sub = self.create_subscription(
             Float32, self.external_force_topic, self.store_uni_force, 10)
         self.wrench_sub = self.create_subscription(
@@ -146,6 +180,12 @@ class ModeHandler(Node):
 
         self.get_logger().info('ModeHandler initialized, waiting for startup...')
         self.get_logger().info(f'SpaceMouse input topic: {self.spacemouse_input_topic}')
+        self.get_logger().info(
+            f'Natural optimizing topic: {self.natural_optimizing_topic}'
+        )
+        self.get_logger().info(
+            f'Natural target lost topic: {self.natural_target_lost_topic}'
+        )
         self.get_logger().info(f'Wrench topic: {self.wrench_topic}')
         self.get_logger().info(f'Environment wrench topic: {self.env_wrench_topic}')
         self.get_logger().info(f'External force topic: {self.external_force_topic}')
@@ -175,6 +215,14 @@ class ModeHandler(Node):
 
     def store_curr_sm(self, msg):
         self.curr_sm = msg.data
+
+    def store_natural_optimizing(self, msg):
+        self.natural_optimizing = bool(msg.data)
+        self.last_natural_optimizing_sec = self._now_sec()
+
+    def store_natural_target_lost(self, msg):
+        self.natural_target_lost = bool(msg.data)
+        self.last_natural_target_lost_sec = self._now_sec()
 
     def store_uni_force(self, msg):
         self.external_force = msg.data
@@ -267,6 +315,31 @@ class ModeHandler(Node):
             return False
         return (self._now_sec() - self.last_env_wrench_sec) <= self.env_wrench_timeout_s
 
+    def natural_optimizing_active(self):
+        if not self.natural_optimizing:
+            return False
+        if self.last_natural_optimizing_sec is None:
+            return False
+        return (
+            self._now_sec() - self.last_natural_optimizing_sec
+        ) <= self.natural_optimizing_timeout_s
+
+    def natural_target_lost_active(self):
+        if not self.natural_target_lost:
+            return False
+        if self.last_natural_target_lost_sec is None:
+            return False
+        return (
+            self._now_sec() - self.last_natural_target_lost_sec
+        ) <= self.natural_optimizing_timeout_s
+
+    def led_command_for_mode(self):
+        if self.mode == MODE_NATURAL and self.natural_target_lost_active():
+            return 'r'
+        if self.mode == MODE_NATURAL and self.natural_optimizing_active():
+            return 'p'
+        return self.mode_colors.get(self.mode, 'r')
+
     def attached(self):
         return int(self.tool_contact) != 0
 
@@ -358,7 +431,7 @@ class ModeHandler(Node):
         if new_mode != self.mode:
             self.mode = new_mode
             self.get_logger().info(f'Mode changed to: {self.mode}')
-        self.led_pub.publish(String(data=self.mode_colors.get(self.mode, 'r')))
+        self.led_pub.publish(String(data=self.led_command_for_mode()))
 
         if self.enable_freedrive_controller_topic:
             self.freedrive_pub.publish(Bool(data=(self.mode == MODE_KINESTHETIC)))
