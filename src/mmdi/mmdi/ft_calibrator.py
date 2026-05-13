@@ -3,10 +3,10 @@
 """Startup force/torque calibration gate.
 
 The calibrator waits until the tool is attached, gathers samples from the
-internal and external FT streams, estimates the startup gravity/bias wrench in
-the base frame, then republishes calibrated wrenches.  Downstream controllers
-should consume the calibrated topics and wait for /ft_calibration/ready before
-allowing robot inputs.
+internal and external FT streams, estimates the startup gravity/bias wrench,
+then republishes calibrated wrenches.  Downstream controllers should consume
+the calibrated topics and wait for /ft_calibration/ready before allowing robot
+inputs.
 """
 
 from typing import Optional, Tuple
@@ -36,8 +36,10 @@ class FTCalibrator(Node):
             "internal_raw_topic",
             "/force_torque_sensor_broadcaster/wrench",
         )
+        self.declare_parameter("internal_raw_frame", "tool0")
         self.declare_parameter("internal_output_topic", "/ur7e/ft_internal_calibrated")
         self.declare_parameter("external_raw_topic", "/ur7e/ft_env_sensor_raw")
+        self.declare_parameter("external_raw_frame", "base")
         self.declare_parameter("external_output_topic", "/ur7e/ft_env_sensor")
         self.declare_parameter("tool_contact_topic", "/tool_contact")
         self.declare_parameter("ready_topic", "/ft_calibration/ready")
@@ -49,10 +51,12 @@ class FTCalibrator(Node):
         self.base_frame = str(self.get_parameter("base_frame").value)
         self.tool_frame = str(self.get_parameter("tool_frame").value)
         self.internal_raw_topic = str(self.get_parameter("internal_raw_topic").value)
+        self.internal_raw_frame = str(self.get_parameter("internal_raw_frame").value)
         self.internal_output_topic = str(
             self.get_parameter("internal_output_topic").value
         )
         self.external_raw_topic = str(self.get_parameter("external_raw_topic").value)
+        self.external_raw_frame = str(self.get_parameter("external_raw_frame").value)
         self.external_output_topic = str(
             self.get_parameter("external_output_topic").value
         )
@@ -119,8 +123,9 @@ class FTCalibrator(Node):
         self.get_logger().info(
             "FT calibration waiting for attached tool and "
             f"{self.sample_count} samples; internal={self.internal_raw_topic} -> "
-            f"{self.internal_output_topic}, external={self.external_raw_topic} -> "
-            f"{self.external_output_topic}, external_required={self.external_required}"
+            f"{self.internal_output_topic} ({self.internal_raw_frame}), "
+            f"external={self.external_raw_topic} -> {self.external_output_topic} "
+            f"({self.external_raw_frame}), external_required={self.external_required}"
         )
 
     def on_tool_contact(self, msg: Int32):
@@ -132,10 +137,7 @@ class FTCalibrator(Node):
             return True
         return self.have_contact_msg and self.tool_attached
 
-    def _wrench_to_base(
-        self,
-        msg: WrenchStamped,
-    ) -> Optional[Tuple[np.ndarray, np.ndarray]]:
+    def _wrench_arrays(self, msg: WrenchStamped) -> Tuple[np.ndarray, np.ndarray]:
         force = np.array(
             [msg.wrench.force.x, msg.wrench.force.y, msg.wrench.force.z],
             dtype=float,
@@ -144,9 +146,14 @@ class FTCalibrator(Node):
             [msg.wrench.torque.x, msg.wrench.torque.y, msg.wrench.torque.z],
             dtype=float,
         )
-        source_frame = msg.header.frame_id if msg.header.frame_id else self.base_frame
+        return force, torque
+
+    def _source_frame(self, msg: WrenchStamped, fallback_frame: str) -> str:
+        return msg.header.frame_id if msg.header.frame_id else fallback_frame
+
+    def _rotation_to_base(self, source_frame: str) -> Optional[ScipyR]:
         if source_frame == self.base_frame:
-            return force, torque
+            return ScipyR.identity()
 
         try:
             trans = self.tf_buffer.lookup_transform(
@@ -163,7 +170,18 @@ class FTCalibrator(Node):
             return None
 
         q = trans.transform.rotation
-        rot = ScipyR.from_quat([q.x, q.y, q.z, q.w])
+        return ScipyR.from_quat([q.x, q.y, q.z, q.w])
+
+    def _wrench_to_base(
+        self,
+        msg: WrenchStamped,
+        fallback_frame: str,
+    ) -> Optional[Tuple[np.ndarray, np.ndarray]]:
+        force, torque = self._wrench_arrays(msg)
+        source_frame = self._source_frame(msg, fallback_frame)
+        rot = self._rotation_to_base(source_frame)
+        if rot is None:
+            return None
         return rot.apply(force), rot.apply(torque)
 
     def _publish_calibrated(
@@ -172,8 +190,9 @@ class FTCalibrator(Node):
         force_bias: np.ndarray,
         torque_bias: np.ndarray,
         pub,
+        fallback_frame: str,
     ):
-        converted = self._wrench_to_base(msg)
+        converted = self._wrench_to_base(msg, fallback_frame)
         if converted is None:
             return
         force_base, torque_base = converted
@@ -191,16 +210,38 @@ class FTCalibrator(Node):
         out.wrench.torque.z = float(torque_out[2])
         pub.publish(out)
 
+    def _publish_internal_calibrated(self, msg: WrenchStamped):
+        force, torque = self._wrench_arrays(msg)
+        source_frame = self._source_frame(msg, self.internal_raw_frame)
+        rot_base_source = self._rotation_to_base(source_frame)
+        if rot_base_source is None:
+            return
+
+        # The internal sensor reports in the tool/sensor frame on some UR setups,
+        # sometimes with an empty header.  Project the startup base-frame gravity
+        # estimate into the current sensor frame before subtracting it, so wrist
+        # rotations do not reintroduce XYZ force offsets.
+        force_bias_source = rot_base_source.inv().apply(self.internal_force_bias)
+        torque_bias_source = rot_base_source.inv().apply(self.internal_torque_bias)
+        force_out = rot_base_source.apply(force - force_bias_source)
+        torque_out = rot_base_source.apply(torque - torque_bias_source)
+
+        out = WrenchStamped()
+        out.header.stamp = msg.header.stamp
+        out.header.frame_id = self.base_frame
+        out.wrench.force.x = float(force_out[0])
+        out.wrench.force.y = float(force_out[1])
+        out.wrench.force.z = float(force_out[2])
+        out.wrench.torque.x = float(torque_out[0])
+        out.wrench.torque.y = float(torque_out[1])
+        out.wrench.torque.z = float(torque_out[2])
+        self.internal_pub.publish(out)
+
     def on_internal_wrench(self, msg: WrenchStamped):
         if self.ready:
-            self._publish_calibrated(
-                msg,
-                self.internal_force_bias,
-                self.internal_torque_bias,
-                self.internal_pub,
-            )
+            self._publish_internal_calibrated(msg)
             return
-        self._collect_sample(msg, self.internal_samples)
+        self._collect_sample(msg, self.internal_samples, self.internal_raw_frame)
 
     def on_external_wrench(self, msg: WrenchStamped):
         if self.ready:
@@ -209,11 +250,12 @@ class FTCalibrator(Node):
                 self.external_force_bias,
                 self.external_torque_bias,
                 self.external_pub,
+                self.external_raw_frame,
             )
             return
-        self._collect_sample(msg, self.external_samples)
+        self._collect_sample(msg, self.external_samples, self.external_raw_frame)
 
-    def _collect_sample(self, msg: WrenchStamped, samples: list):
+    def _collect_sample(self, msg: WrenchStamped, samples: list, fallback_frame: str):
         if not self._can_calibrate():
             if not self.logged_waiting:
                 self.get_logger().warn(
@@ -223,7 +265,7 @@ class FTCalibrator(Node):
                 self.logged_waiting = True
             return
 
-        converted = self._wrench_to_base(msg)
+        converted = self._wrench_to_base(msg, fallback_frame)
         if converted is None:
             return
         if len(samples) < self.sample_count:

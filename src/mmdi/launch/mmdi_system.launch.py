@@ -20,8 +20,8 @@ def generate_launch_description():
             }]
         ),
 
-        # Startup FT calibration gate. Blocks mode/control until internal and
-        # external FT biases are estimated with the tool attached.
+        # Startup FT calibration gate. Blocks mode/control until the internal
+        # FT bias is estimated with the tool attached; external FT is optional.
         Node(
             package='mmdi',
             executable='ft_calibrator',
@@ -29,11 +29,12 @@ def generate_launch_description():
             output='screen',
             parameters=[{
                 'internal_raw_topic': '/force_torque_sensor_broadcaster/wrench',
+                'internal_raw_frame': 'tool0',
                 'internal_output_topic': '/ur7e/ft_internal_calibrated',
                 'external_raw_topic': '/ur7e/ft_env_sensor_raw',
                 'external_output_topic': '/ur7e/ft_env_sensor',
                 'sample_count': 200,
-                'external_required': True,
+                'external_required': False,
                 'require_tool_attached': True,
             }]
         ),
