@@ -73,6 +73,7 @@ def generate_launch_description():
                 'calibration_required': True,
                 'wrench_topic': '/ur7e/ft_internal_calibrated',
                 'wrench_tare_samples': 0,
+                'enable_freedrive_controller_topic': False,
             }]
         ),
 
@@ -183,9 +184,9 @@ def generate_launch_description():
                 'global_tool_pos_min': [0.09, -0.43, 0.24],
                 'global_tool_pos_max': [0.64, 0.44, 0.49],
                 'look_alignment_weight': 100.0,
-                'camera_distance_min_m': 0.20,
-                'camera_distance_max_m': 0.40,
-                'camera_distance_weight': 20.0,
+                'camera_distance_min_m': 0.14,
+                'camera_distance_max_m': 0.25,
+                'camera_distance_weight': 60.0,
                 'side_offset_m': 0.20,
                 'side_preference_weight': 10.0,
                 'side_axis_sign': -1.0,

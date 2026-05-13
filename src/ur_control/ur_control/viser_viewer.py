@@ -252,7 +252,7 @@ class ViserViewer(Node):
                 self.on_desired_pose,
                 1,
             )
-        if self.show_fused:
+        if self.show_fused or self.show_fused_display:
             self.fused_pose_sub = self.create_subscription(
                 PoseWithCovarianceStamped,
                 self.fused_pose_topic,

@@ -30,7 +30,9 @@ def generate_launch_description():
         DeclareLaunchArgument(
             "use_urscript_freedrive",
             default_value="true",
-            description="Use URScript-based freedrive controller (experimental).",
+            description=(
+                "Use custom URScript-based freedrive controller for mode 2."
+            ),
         ),
         DeclareLaunchArgument(
             "external_ft_required",
