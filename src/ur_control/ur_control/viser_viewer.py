@@ -1,20 +1,43 @@
 #!/usr/bin/env python3
+import io
+import os
+import time
+from pathlib import Path
+
 import numpy as np
 import rclpy
 from rclpy.node import Node
+from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
 
 import tf2_ros
 from geometry_msgs.msg import PoseStamped, PoseWithCovarianceStamped
 from nav_msgs.msg import Odometry
 from sensor_msgs.msg import JointState
-from std_msgs.msg import Int32
+from std_msgs.msg import Int32, String
 
 import viser
+
+try:
+    from ament_index_python.packages import get_package_share_directory
+except Exception:  # pragma: no cover - only available in sourced ROS envs
+    get_package_share_directory = None
+
+try:
+    from rcl_interfaces.msg import ParameterType
+    from rcl_interfaces.srv import GetParameters
+except Exception:  # pragma: no cover - only available in sourced ROS envs
+    ParameterType = None
+    GetParameters = None
 
 try:
     from robot_descriptions.loaders.yourdfpy import load_robot_description
 except Exception:  # pragma: no cover - optional dependency path
     load_robot_description = None
+
+try:
+    import yourdfpy
+except Exception:  # pragma: no cover - optional dependency path
+    yourdfpy = None
 
 try:
     from viser.extras import ViserUrdf
@@ -40,13 +63,21 @@ class ViserViewer(Node):
         self.declare_parameter('show_actual_pose', True)
         self.declare_parameter('show_desired_pose', True)
         self.declare_parameter('show_camera_pose', True)
-        self.declare_parameter('show_fused_pose', True)
+        self.declare_parameter('show_fused_pose', False)
         self.declare_parameter('show_fused_display_pose', True)
         self.declare_parameter('grid_size', 2.0)
         self.declare_parameter('axes_length', 0.2)
         self.declare_parameter('axes_radius', 0.01)
         self.declare_parameter('robot_description', 'ur5e_description')
         self.declare_parameter('robot_urdf_path', '')
+        self.declare_parameter('prefer_robot_description_param', True)
+        self.declare_parameter(
+            'robot_description_param_node',
+            '/robot_state_publisher',
+        )
+        self.declare_parameter('robot_description_param_timeout_s', 2.0)
+        self.declare_parameter('robot_description_topic', '/robot_description')
+        self.declare_parameter('robot_description_topic_timeout_s', 2.0)
         self.declare_parameter('joint_state_topic', '/joint_states')
         self.declare_parameter('load_meshes', True)
         self.declare_parameter('load_collision_meshes', False)
@@ -77,6 +108,21 @@ class ViserViewer(Node):
         self.axes_radius = float(self.get_parameter('axes_radius').value)
         self.robot_description = self.get_parameter('robot_description').value
         self.robot_urdf_path = self.get_parameter('robot_urdf_path').value
+        self.prefer_robot_description_param = bool(
+            self.get_parameter('prefer_robot_description_param').value
+        )
+        self.robot_description_param_node = self.get_parameter(
+            'robot_description_param_node'
+        ).value
+        self.robot_description_param_timeout_s = float(
+            self.get_parameter('robot_description_param_timeout_s').value
+        )
+        self.robot_description_topic = self.get_parameter(
+            'robot_description_topic'
+        ).value
+        self.robot_description_topic_timeout_s = float(
+            self.get_parameter('robot_description_topic_timeout_s').value
+        )
         self.joint_state_topic = self.get_parameter('joint_state_topic').value
         self.load_meshes = bool(self.get_parameter('load_meshes').value)
         self.load_collision_meshes = bool(
@@ -259,15 +305,29 @@ class ViserViewer(Node):
         loaded_from = ''
 
         if self.robot_urdf_path:
-            urdf_or_path = self.robot_urdf_path
+            urdf_or_path = Path(self.robot_urdf_path)
             loaded_from = self.robot_urdf_path
-        elif load_robot_description is None:
+        elif self.prefer_robot_description_param:
+            urdf_or_path = self._load_robot_description_param()
+            if urdf_or_path is not None:
+                loaded_from = (
+                    f"{self.robot_description_param_source}:robot_description"
+                )
+            else:
+                urdf_or_path = self._load_robot_description_topic()
+                if urdf_or_path is not None:
+                    loaded_from = self.robot_description_topic
+
+        if urdf_or_path is None and load_robot_description is None:
             self.get_logger().warn(
                 "URDF view disabled: install 'robot_descriptions' and "
-                "'yourdfpy' to enable robot model rendering."
+                "'yourdfpy' to enable robot model rendering, or start "
+                "robot_state_publisher so its robot_description parameter "
+                "can be used."
             )
             return
-        else:
+
+        if urdf_or_path is None:
             description_candidates = [self.robot_description]
             if self.robot_description == 'ur5e_description':
                 description_candidates.append('ur5_description')
@@ -342,6 +402,240 @@ class ViserViewer(Node):
             self.viser_urdf = None
             self.robot_joint_names = []
             self.get_logger().warn(f"Failed to build URDF viewer: {ex}")
+
+    def _load_robot_description_param(self):
+        if GetParameters is None or ParameterType is None or yourdfpy is None:
+            return None
+
+        node_name = str(self.robot_description_param_node).strip()
+        timeout_s = max(0.0, self.robot_description_param_timeout_s)
+        self.robot_description_param_source = node_name
+
+        tried_services = set()
+        if node_name:
+            service_name = f"{node_name.rstrip('/')}/get_parameters"
+            tried_services.add(service_name)
+            urdf = self._load_robot_description_from_service(
+                service_name,
+                node_name,
+                timeout_s,
+                warn=False,
+            )
+            if urdf is not None:
+                self.robot_description_param_source = node_name
+                return urdf
+
+        for service_name in self._robot_description_service_candidates(
+            tried_services
+        ):
+            provider = service_name.removesuffix('/get_parameters')
+            urdf = self._load_robot_description_from_service(
+                service_name,
+                provider,
+                timeout_s,
+                warn=False,
+            )
+            if urdf is not None:
+                self.robot_description_param_source = provider
+                self.get_logger().info(
+                    "Discovered robot_description from "
+                    f"'{provider}'."
+                )
+                return urdf
+
+        if node_name:
+            self.get_logger().warn(
+                "Could not read robot_description from "
+                f"'{node_name}', and no other parameter service with a valid "
+                "robot_description was found."
+            )
+        return None
+
+    def _load_robot_description_topic(self):
+        if yourdfpy is None:
+            return None
+
+        topic_name = str(self.robot_description_topic).strip()
+        if not topic_name:
+            return None
+
+        xml_holder = {'xml': None}
+
+        def on_robot_description(msg):
+            xml_holder['xml'] = msg.data
+
+        qos_profiles = [
+            QoSProfile(
+                history=HistoryPolicy.KEEP_LAST,
+                depth=1,
+                reliability=ReliabilityPolicy.RELIABLE,
+                durability=DurabilityPolicy.TRANSIENT_LOCAL,
+            ),
+            QoSProfile(
+                history=HistoryPolicy.KEEP_LAST,
+                depth=1,
+                reliability=ReliabilityPolicy.RELIABLE,
+                durability=DurabilityPolicy.VOLATILE,
+            ),
+            QoSProfile(
+                history=HistoryPolicy.KEEP_LAST,
+                depth=1,
+                reliability=ReliabilityPolicy.BEST_EFFORT,
+                durability=DurabilityPolicy.VOLATILE,
+            ),
+        ]
+        subscriptions = [
+            self.create_subscription(
+                String,
+                topic_name,
+                on_robot_description,
+                qos,
+            )
+            for qos in qos_profiles
+        ]
+
+        deadline = time.monotonic() + max(0.0, self.robot_description_topic_timeout_s)
+        try:
+            while xml_holder['xml'] is None and time.monotonic() < deadline:
+                rclpy.spin_once(self, timeout_sec=0.1)
+        finally:
+            for sub in subscriptions:
+                self.destroy_subscription(sub)
+
+        xml = (xml_holder['xml'] or '').strip()
+        if not self._looks_like_urdf(xml):
+            self.get_logger().warn(
+                f"No valid robot_description received on '{topic_name}'."
+            )
+            return None
+
+        urdf = self._parse_robot_description_xml(xml, topic_name)
+        if urdf is not None:
+            self.get_logger().info(
+                f"Loaded robot_description from topic '{topic_name}'."
+            )
+        return urdf
+
+    def _robot_description_service_candidates(self, skip_services):
+        try:
+            services = self.get_service_names_and_types()
+        except Exception:
+            return []
+
+        candidates = []
+        for service_name, service_types in services:
+            if service_name in skip_services:
+                continue
+            if not service_name.endswith('/get_parameters'):
+                continue
+            if 'rcl_interfaces/srv/GetParameters' not in service_types:
+                continue
+            if service_name == f"/{self.get_name()}/get_parameters":
+                continue
+            candidates.append(service_name)
+
+        def sort_key(service_name):
+            provider = service_name.removesuffix('/get_parameters')
+            is_rsp = 'robot_state_publisher' not in provider
+            return (is_rsp, provider)
+
+        return sorted(candidates, key=sort_key)
+
+    def _load_robot_description_from_service(
+        self,
+        service_name,
+        provider_name,
+        timeout_s,
+        warn,
+    ):
+        client = self.create_client(GetParameters, service_name)
+
+        if not client.wait_for_service(timeout_sec=timeout_s):
+            if warn:
+                self.get_logger().warn(
+                    f"Could not read robot_description: service "
+                    f"'{service_name}' is not available."
+                )
+            return None
+
+        request = GetParameters.Request()
+        request.names = ['robot_description']
+        future = client.call_async(request)
+        rclpy.spin_until_future_complete(self, future, timeout_sec=timeout_s)
+
+        if not future.done():
+            if warn:
+                self.get_logger().warn(
+                    "Timed out reading robot_description from "
+                    f"'{provider_name}'."
+                )
+            return None
+        if future.exception() is not None:
+            if warn:
+                self.get_logger().warn(
+                    "Failed to read robot_description from "
+                    f"'{provider_name}': {future.exception()}"
+                )
+            return None
+
+        response = future.result()
+        if not response.values:
+            return None
+
+        value = response.values[0]
+        if value.type != ParameterType.PARAMETER_STRING:
+            return None
+
+        xml = value.string_value.strip()
+        if not self._looks_like_urdf(xml):
+            return None
+
+        urdf = self._parse_robot_description_xml(xml, provider_name)
+        if urdf is None and warn:
+            self.get_logger().warn(
+                f"Failed to parse robot_description from '{provider_name}'."
+            )
+        return urdf
+
+    def _parse_robot_description_xml(self, xml, source_name):
+        try:
+            return yourdfpy.URDF.load(
+                io.StringIO(xml),
+                build_scene_graph=self.load_meshes,
+                build_collision_scene_graph=self.load_collision_meshes,
+                load_meshes=self.load_meshes,
+                load_collision_meshes=self.load_collision_meshes,
+                filename_handler=self._resolve_urdf_filename,
+            )
+        except Exception as ex:
+            self.get_logger().warn(
+                f"Failed to parse robot_description from '{source_name}': {ex}"
+            )
+            return None
+
+    @staticmethod
+    def _looks_like_urdf(xml):
+        return '<robot' in xml[:512]
+
+    @staticmethod
+    def _resolve_urdf_filename(fname, dir=None):
+        filename = fname
+        if (
+            isinstance(filename, str)
+            and filename.startswith('package://')
+            and get_package_share_directory is not None
+        ):
+            package_path = filename[len('package://'):]
+            package_name, _, relative_path = package_path.partition('/')
+            if package_name and relative_path:
+                try:
+                    return os.path.join(
+                        get_package_share_directory(package_name),
+                        relative_path,
+                    )
+                except Exception:
+                    return filename
+        return filename
 
     @staticmethod
     def quat_xyzw_to_wxyz(q):

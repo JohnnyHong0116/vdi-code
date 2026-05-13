@@ -12,6 +12,8 @@
   <depend>geometry_msgs</depend>
   <depend>sensor_msgs</depend>
   <depend>tf2_ros</depend>
+  <depend>rcl_interfaces</depend>
+  <depend>ament_index_python</depend>
   <depend>controller_manager_msgs</depend>
   <depend>std_srvs</depend>
 

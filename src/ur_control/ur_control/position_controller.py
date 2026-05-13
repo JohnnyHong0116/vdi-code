@@ -2,6 +2,7 @@
 import numpy as np
 import rclpy
 from rclpy.node import Node
+from rclpy.duration import Duration
 
 import tf2_ros
 from geometry_msgs.msg import PoseStamped
@@ -51,6 +52,7 @@ class PositionController(Node):
         self.des_q = None
         self.mode = -1
         self.was_mode_2 = False
+        self.warned_tf_unavailable = False
 
         self.timer = self.create_timer(1.0 / self.rate_hz, self.tick)
 
@@ -70,10 +72,31 @@ class PositionController(Node):
     def tick(self):
         # Get current EE pose from TF
         try:
-            trans = self.tf_buffer.lookup_transform(self.base_frame, self.tool_frame, rclpy.time.Time())
+            tf_time = rclpy.time.Time()
+            if not self.tf_buffer.can_transform(
+                self.base_frame,
+                self.tool_frame,
+                tf_time,
+                timeout=Duration(seconds=0.02),
+            ):
+                if not self.warned_tf_unavailable:
+                    self.get_logger().warn(
+                        f"Waiting for TF {self.base_frame} -> {self.tool_frame}"
+                    )
+                    self.warned_tf_unavailable = True
+                return
+            trans = self.tf_buffer.lookup_transform(
+                self.base_frame,
+                self.tool_frame,
+                tf_time,
+            )
         except Exception as e:
-            self.get_logger().warn(f"TF lookup failed: {e}")
+            self.get_logger().warn(
+                f"TF lookup failed: {e}",
+                throttle_duration_sec=1.0,
+            )
             return
+        self.warned_tf_unavailable = False
 
         curr_p = np.array([
             trans.transform.translation.x,

@@ -25,6 +25,7 @@ class WrenchEnvSensor(Node):
         self.declare_parameter("base_frame", "base")
         self.declare_parameter("tool_frame", "tool0")
         self.declare_parameter("output_topic", "/ur7e/ft_env_sensor_raw")
+        self.declare_parameter("output_frame", "base")
         self.declare_parameter("rate_hz", 100.0)
         self.declare_parameter("tare_on_startup", False)
 
@@ -33,6 +34,7 @@ class WrenchEnvSensor(Node):
         self.base_frame = str(self.get_parameter("base_frame").value)
         self.tool_frame = str(self.get_parameter("tool_frame").value)
         self.output_topic = str(self.get_parameter("output_topic").value)
+        self.output_frame = str(self.get_parameter("output_frame").value)
         self.rate_hz = float(self.get_parameter("rate_hz").value)
         self.tare_on_startup = bool(self.get_parameter("tare_on_startup").value)
 
@@ -66,8 +68,9 @@ class WrenchEnvSensor(Node):
 
         self.R_ftmini_to_tool = ScipyR.from_euler("z", 90.0, degrees=True)
         self.get_logger().info(
-            f"Publishing {self.output_topic}; TF {self.base_frame} <- "
-            f"{self.tool_frame}; FTmini {self.sensor_ip}:{self.sensor_port}"
+            f"Publishing {self.output_topic} in {self.output_frame}; "
+            f"TF {self.base_frame} <- {self.tool_frame}; "
+            f"FTmini {self.sensor_ip}:{self.sensor_port}"
         )
 
     def update_tool_pose(self):
@@ -142,27 +145,40 @@ class WrenchEnvSensor(Node):
         force_tool = self.R_ftmini_to_tool.apply(force_s)
         torque_tool = self.R_ftmini_to_tool.apply(torque_s)
 
-        R_base_tool = ScipyR.from_quat(self.tool_q)
-        force_global = R_base_tool.apply(force_tool)
-        torque_global = R_base_tool.apply(torque_tool)
+        if self.output_frame == self.base_frame:
+            R_base_tool = ScipyR.from_quat(self.tool_q)
+            force_out = R_base_tool.apply(force_tool)
+            torque_out = R_base_tool.apply(torque_tool)
+        elif self.output_frame == self.tool_frame:
+            force_out = force_tool
+            torque_out = torque_tool
+        else:
+            self.get_logger().warn(
+                f"Unsupported output_frame '{self.output_frame}', using "
+                f"{self.base_frame}.",
+                throttle_duration_sec=2.0,
+            )
+            R_base_tool = ScipyR.from_quat(self.tool_q)
+            force_out = R_base_tool.apply(force_tool)
+            torque_out = R_base_tool.apply(torque_tool)
 
         a = 0.307
         if self.force_prev is not None:
-            force_global = a * self.force_prev + (1 - a) * force_global
-            torque_global = a * self.torque_prev + (1 - a) * torque_global
+            force_out = a * self.force_prev + (1 - a) * force_out
+            torque_out = a * self.torque_prev + (1 - a) * torque_out
 
-        self.force_prev = force_global
-        self.torque_prev = torque_global
+        self.force_prev = force_out
+        self.torque_prev = torque_out
 
         out = WrenchStamped()
         out.header.stamp = self.get_clock().now().to_msg()
-        out.header.frame_id = self.base_frame
-        out.wrench.force.x = float(force_global[0])
-        out.wrench.force.y = float(force_global[1])
-        out.wrench.force.z = float(force_global[2])
-        out.wrench.torque.x = float(torque_global[0])
-        out.wrench.torque.y = float(torque_global[1])
-        out.wrench.torque.z = float(torque_global[2])
+        out.header.frame_id = self.output_frame
+        out.wrench.force.x = float(force_out[0])
+        out.wrench.force.y = float(force_out[1])
+        out.wrench.force.z = float(force_out[2])
+        out.wrench.torque.x = float(torque_out[0])
+        out.wrench.torque.y = float(torque_out[1])
+        out.wrench.torque.z = float(torque_out[2])
 
         self.pub.publish(out)
 

@@ -4,12 +4,23 @@
 Converted to ROS 2 from ROS 1
 """
 
+from launch.actions import DeclareLaunchArgument
 from launch import LaunchDescription
+from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
+from launch_ros.parameter_descriptions import ParameterValue
 
 
 def generate_launch_description():
+    external_ft_required = LaunchConfiguration('external_ft_required')
+
     return LaunchDescription([
+        DeclareLaunchArgument(
+            'external_ft_required',
+            default_value='false',
+            description='Wait for external FT sensor startup calibration.',
+        ),
+
         Node(
             package='mmdi',
             executable='arduino_handler',
@@ -30,12 +41,25 @@ def generate_launch_description():
             parameters=[{
                 'internal_raw_topic': '/force_torque_sensor_broadcaster/wrench',
                 'internal_raw_frame': 'tool0',
+                'internal_use_msg_frame_id': True,
+                'internal_source_frame_bias': False,
+                'internal_force_bias_axes': [True, True, True],
+                'internal_force_deadband_n': 1.5,
+                'internal_torque_deadband_nm': 0.05,
                 'internal_output_topic': '/ur7e/ft_internal_calibrated',
                 'external_raw_topic': '/ur7e/ft_env_sensor_raw',
+                'external_raw_frame': 'tool0',
+                'external_source_frame_bias': True,
                 'external_output_topic': '/ur7e/ft_env_sensor',
                 'sample_count': 200,
-                'external_required': False,
+                'external_required': ParameterValue(
+                    external_ft_required,
+                    value_type=bool,
+                ),
                 'require_tool_attached': True,
+                'stability_check_enabled': True,
+                'force_stddev_max_n': 1.0,
+                'torque_stddev_max_nm': 0.08,
             }]
         ),
 
@@ -112,30 +136,30 @@ def generate_launch_description():
         # Static transform: hande_link_tool -> head_camera
         # Measured camera mount:
         #   camera center in tool0 frame:
-        #     x=+99.47 mm, y=+31.80 mm, z=+78.76 mm
+        #     x=-99.47 mm, y=-31.80 mm, z=+54.09 mm
         #   hande_link_tool axes map into tool0 as:
         #     +X_hande -> +Y_tool0, +Y_hande -> +X_tool0, +Z_hande -> -Z_tool0
         #   so the translation in hande_link_tool is:
-        #     x=+0.03180 m, y=+0.09947 m, z=-0.07876 m
-        #   camera axes in tool0 should be:
-        #     x_cam = -y_tool0
-        #   then rotate +30 deg about the current camera x-axis:
-        #     y_cam =  cos(30) * x_tool0 + sin(30) * z_tool0
-        #     z_cam = -sin(30) * x_tool0 + cos(30) * z_tool0
+        #     x=-0.03180 m, y=-0.09947 m, z=-0.05409 m
+        #   camera axes in tool0 are the old mount orientation yawed 180 deg
+        #   about tool0 +Z while preserving the same 30 deg camera tilt:
+        #     x_cam = +y_tool0
+        #     y_cam = -cos(30) * x_tool0 + sin(30) * z_tool0
+        #     z_cam =  sin(30) * x_tool0 + cos(30) * z_tool0
         #   with the existing hande_link_tool alignment, this corresponds to:
-        #   q = [0.0, 0.9659258263, -0.2588190451, 0.0]
+        #   q = [0.9659258263, 0.0, 0.0, -0.2588190451]
         Node(
             package='tf2_ros',
             executable='static_transform_publisher',
             name='camera_frame_converter',
             arguments=[
-                '--x', '0.03180',
-                '--y', '0.09947',
-                '--z', '-0.07876',
+                '--x', '-0.03180',
+                '--y', '-0.09947',
+                '--z', '-0.05409',
                 '--qx', '0.9659258263',
                 '--qy', '0.0',
                 '--qz', '0.0',
-                '--qw', '0.2588190451',
+                '--qw', '-0.2588190451',
                 '--frame-id', 'hande_link_tool',
                 '--child-frame-id', 'head_camera'
             ]

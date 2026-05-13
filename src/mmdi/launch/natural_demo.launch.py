@@ -12,6 +12,7 @@ from ament_index_python.packages import get_package_share_directory
 def generate_launch_description():
     start_mmdi = LaunchConfiguration("start_mmdi")
     use_urscript_freedrive = LaunchConfiguration("use_urscript_freedrive")
+    external_ft_required = LaunchConfiguration("external_ft_required")
 
     mmdi_launch = PythonLaunchDescriptionSource(
         [
@@ -30,6 +31,11 @@ def generate_launch_description():
             "use_urscript_freedrive",
             default_value="true",
             description="Use URScript-based freedrive controller (experimental).",
+        ),
+        DeclareLaunchArgument(
+            "external_ft_required",
+            default_value="true",
+            description="Wait for external FT sensor startup calibration.",
         ),
         Node(
             package="ur_control",
@@ -63,11 +69,15 @@ def generate_launch_description():
             output="screen",
             parameters=[{
                 "output_topic": "/ur7e/ft_env_sensor_raw",
+                "output_frame": "tool0",
                 "tare_on_startup": False,
             }],
         ),
         IncludeLaunchDescription(
             mmdi_launch,
             condition=IfCondition(start_mmdi),
+            launch_arguments={
+                "external_ft_required": external_ft_required,
+            }.items(),
         ),
     ])
