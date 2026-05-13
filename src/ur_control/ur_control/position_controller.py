@@ -26,6 +26,7 @@ class PositionController(Node):
         self.declare_parameter('ang_P', 1.5)
         self.declare_parameter('max_lin_vel', 0.25)   # m/s clamp
         self.declare_parameter('max_ang_vel', 1.0)    # rad/s clamp
+        self.declare_parameter('freedrive_exit_hold_s', 0.5)
 
         self.base_frame = self.get_parameter('base_frame').value
         self.tool_frame = self.get_parameter('tool_frame').value
@@ -38,6 +39,10 @@ class PositionController(Node):
         self.ang_P = float(self.get_parameter('ang_P').value)
         self.max_lin_vel = float(self.get_parameter('max_lin_vel').value)
         self.max_ang_vel = float(self.get_parameter('max_ang_vel').value)
+        self.freedrive_exit_hold_s = max(
+            0.0,
+            float(self.get_parameter('freedrive_exit_hold_s').value),
+        )
 
         # TF
         self.tf_buffer = tf2_ros.Buffer()
@@ -52,6 +57,8 @@ class PositionController(Node):
         self.des_q = None
         self.mode = -1
         self.was_mode_2 = False
+        self.resume_speedl_after_s = None
+        self.sent_freedrive_exit_stop = False
         self.warned_tf_unavailable = False
 
         self.timer = self.create_timer(1.0 / self.rate_hz, self.tick)
@@ -67,7 +74,12 @@ class PositionController(Node):
                                msg.pose.orientation.z, msg.pose.orientation.w], dtype=float)
 
     def on_mode(self, msg: Int32):
-        self.mode = int(msg.data)
+        new_mode = int(msg.data)
+        if self.mode == 2 and new_mode != 2:
+            now_s = self.get_clock().now().nanoseconds / 1e9
+            self.resume_speedl_after_s = now_s + self.freedrive_exit_hold_s
+            self.sent_freedrive_exit_stop = False
+        self.mode = new_mode
 
     def tick(self):
         # Get current EE pose from TF
@@ -119,6 +131,18 @@ class PositionController(Node):
             self.was_mode_2 = True
             return
         self.was_mode_2 = False
+
+        if self.resume_speedl_after_s is not None:
+            now_s = self.get_clock().now().nanoseconds / 1e9
+            if now_s < self.resume_speedl_after_s:
+                self.des_p = curr_p.copy()
+                self.des_q = curr_q.copy()
+                if not self.sent_freedrive_exit_stop:
+                    self.urscript_pub.publish(String(data="speedl([0,0,0,0,0,0], 0.5, t=0.02)\n"))
+                    self.sent_freedrive_exit_stop = True
+                return
+            self.resume_speedl_after_s = None
+            self.sent_freedrive_exit_stop = False
 
         if self.des_p is None or self.des_q is None:
             return
