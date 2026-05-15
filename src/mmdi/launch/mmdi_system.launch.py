@@ -135,32 +135,32 @@ def generate_launch_description():
         ),
 
         # Static transform: hande_link_tool -> head_camera
-        # Measured camera mount:
-        #   camera center in tool0 frame:
-        #     x=-99.47 mm, y=-31.80 mm, z=+54.09 mm
+        # CAD camera mount:
+        #   RGB camera center in tool0 frame:
+        #     x=-94.763 mm, y=-32.500 mm, z=+46.56311 mm
         #   hande_link_tool axes map into tool0 as:
         #     +X_hande -> +Y_tool0, +Y_hande -> +X_tool0, +Z_hande -> -Z_tool0
-        #   so the translation in hande_link_tool is:
-        #     x=-0.03180 m, y=-0.09947 m, z=-0.05409 m
+        #   so the equivalent translation in hande_link_tool is:
+        #     x=-0.032500 m, y=-0.094763 m, z=-0.04656311 m
         #   camera axes in tool0 are the old mount orientation yawed 180 deg
-        #   about tool0 +Z while preserving the same 30 deg camera tilt:
+        #   about tool0 +Z while preserving the same 25 deg camera tilt:
         #     x_cam = +y_tool0
-        #     y_cam = -cos(30) * x_tool0 + sin(30) * z_tool0
-        #     z_cam =  sin(30) * x_tool0 + cos(30) * z_tool0
+        #     y_cam = -cos(25) * x_tool0 + sin(25) * z_tool0
+        #     z_cam =  sin(25) * x_tool0 + cos(25) * z_tool0
         #   with the existing hande_link_tool alignment, this corresponds to:
-        #   q = [0.9659258263, 0.0, 0.0, -0.2588190451]
+        #   q = [0.9762960071, 0.0, 0.0, -0.2164396139]
         Node(
             package='tf2_ros',
             executable='static_transform_publisher',
             name='camera_frame_converter',
             arguments=[
-                '--x', '-0.03180',
-                '--y', '-0.09947',
-                '--z', '-0.05409',
-                '--qx', '0.9659258263',
+                '--x', '-0.032500',
+                '--y', '-0.094763',
+                '--z', '-0.04656311',
+                '--qx', '0.9762960071',
                 '--qy', '0.0',
                 '--qz', '0.0',
-                '--qw', '-0.2588190451',
+                '--qw', '-0.2164396139',
                 '--frame-id', 'hande_link_tool',
                 '--child-frame-id', 'head_camera'
             ]

@@ -58,44 +58,56 @@ TAG_IDS = [0, 1, 2, 3, 4, 5, 9, 7]
 DEFAULT_RING_ORDER = [2, 3, 4, 9, 1, 5]
 DEFAULT_IGNORE_IDS = {6}
 DEFAULT_RING_SIGN = -1
-TAG_TILT_DEG = 90.0
-# The new hardware mount flips the tag's in-plane X/Y relative to the old
-# tracker. That is a 180-degree rotation about the tag normal.
-TAG_MOUNT_ROTZ_DEG = 180.0
 PRIMARY_TAG_ID = 2
+TAG_TILT_DEG = 90.0
+TAG_MOUNT_ROTZ_DEG = 180.0
 
-# Ring tags: tag center -> tool tip offset in tag frame (mm)
-CAD_DY_MM = 110.89
-CAD_DZ_MM = -34.15
-# Off-ring tag 0
-CAD0_DY_MM = 48.10
-CAD0_DZ_MM = -25.94
-# Off-ring tag 7
-CAD7_DY_MM = 23.11
-CAD7_DZ_MM = -30.0
+# Onshape CAD measurements, expressed in each tag mate connector frame.
+# tag center -> fused tool point (mm)
+CAD_RING_TAG_TO_PROBE_MM = np.array([-5.738e-7, 124.77820, -34.64174],
+                                    dtype=np.float64)
+CAD_TAG0_TO_PROBE_MM = np.array([0.563, 57.797, -27.350],
+                                dtype=np.float64)
+CAD_TAG7_TO_PROBE_MM = np.array([0.563, 32.797, -27.350],
+                                dtype=np.float64)
 
-MARKER_MM = 19.83
+# Adjacent ring tag spacing from tag 2 -> tag 3 in tag 2 coordinates. The
+# direction matches DEFAULT_RING_SIGN=-1 for the current ring order.
+CAD_TAG2_TO_TAG3_MM = np.array([29.992, 17.206, 0.062], dtype=np.float64)
+
+MARKER_MM = 20.12
+
+
+def make_transform(R_mat, t_vec):
+    T = np.eye(4, dtype=np.float64)
+    T[:3, :3] = np.asarray(R_mat, dtype=np.float64)
+    T[:3, 3] = np.asarray(t_vec, dtype=np.float64).reshape(3)
+    return T
+
+
+def split_transform(T):
+    T = np.asarray(T, dtype=np.float64)
+    return T[:3, :3], T[:3, 3]
 
 
 def build_static(tag_ids, ring_order, ring_sign, ring_yaw0_deg=0.0,
                  ring_step_deg=None):
     """Build per-tag rotation and translation offsets (tag frame -> probe tip).
 
-    Returns dict with 'id_to_R_tag_probe', 'id_to_t_tag_probe', 'tag_ids'.
+    Returns dict with tag -> probe transforms. CAD offsets are expressed in the
+    detected tag frame; runtime pose composition is T_camera_probe =
+    T_camera_tag @ T_tag_probe.
     """
-    dY_default = CAD_DY_MM / 1000.0
-    dZ_default = CAD_DZ_MM / 1000.0
-    t_default = np.array([0.0, dY_default, dZ_default], dtype=np.float64)
-
+    t_default = CAD_RING_TAG_TO_PROBE_MM / 1000.0
     t_by_id = {int(tid): t_default.copy() for tid in tag_ids}
-    t_by_id[0] = np.array([0.0, CAD0_DY_MM / 1000.0, CAD0_DZ_MM / 1000.0],
-                           dtype=np.float64)
-    t_by_id[7] = np.array([0.0, CAD7_DY_MM / 1000.0, CAD7_DZ_MM / 1000.0],
-                           dtype=np.float64)
+    t_by_id[0] = CAD_TAG0_TO_PROBE_MM / 1000.0
+    t_by_id[7] = CAD_TAG7_TO_PROBE_MM / 1000.0
 
     R_tilt = _rotx_deg(TAG_TILT_DEG)
 
-    # Compute yaw per ring tag
+    # Compute yaw per ring tag using the original mounted-ring model. The CAD
+    # values above replace distances; this rotation chain still describes how
+    # the tag frames sit on the probe.
     step = (360.0 / len(ring_order)) if ring_step_deg is None else ring_step_deg
     step *= ring_sign
     yaw_per_tag = {
@@ -109,6 +121,7 @@ def build_static(tag_ids, ring_order, ring_sign, ring_yaw0_deg=0.0,
 
     id_to_R = {}
     id_to_t = {}
+    id_to_T = {}
     for tag_id in tag_ids:
         if tag_id not in yaw_per_tag:
             continue
@@ -116,10 +129,12 @@ def build_static(tag_ids, ring_order, ring_sign, ring_yaw0_deg=0.0,
         R_tag_probe = R_tilt @ _rotz_deg(yaw_deg)
         id_to_R[tag_id] = R_tag_probe
         id_to_t[tag_id] = t_by_id[int(tag_id)]
+        id_to_T[tag_id] = make_transform(R_tag_probe, t_by_id[int(tag_id)])
 
     return {
         "id_to_R_tag_probe": id_to_R,
         "id_to_t_tag_probe": id_to_t,
+        "id_to_T_tag_probe": id_to_T,
         "tag_ids": list(tag_ids),
     }
 
@@ -129,11 +144,9 @@ def compute_probe_from_tag(tag_id, R_c_tag, t_c_tag, static):
 
     Returns (R_c_probe(3,3), t_c_probe(3,)).
     """
-    R_tag_probe = static["id_to_R_tag_probe"][tag_id]
-    t_tag_probe = static["id_to_t_tag_probe"][tag_id]
-    R_c_probe = R_c_tag @ R_tag_probe
-    t_c_probe = t_c_tag + R_c_tag @ t_tag_probe
-    return R_c_probe, t_c_probe
+    T_c_tag = make_transform(R_c_tag, t_c_tag)
+    T_tag_probe = static["id_to_T_tag_probe"][tag_id]
+    return split_transform(T_c_tag @ T_tag_probe)
 
 
 # ===========================================================================
@@ -152,6 +165,46 @@ def draw_axes(img, K, dist, R_mat, t_vec, axis_len=0.04, thickness=2):
     cv2.line(img, origin, tuple(imgpts[1]), (0, 0, 255), thickness)   # X red
     cv2.line(img, origin, tuple(imgpts[2]), (0, 255, 0), thickness)   # Y green
     cv2.line(img, origin, tuple(imgpts[3]), (255, 0, 0), thickness)   # Z blue
+
+
+def put_text_with_outline(img, text, org, font_scale, color, thickness=1):
+    cv2.putText(
+        img, text, org, cv2.FONT_HERSHEY_SIMPLEX, font_scale,
+        (0, 0, 0), thickness + 2, cv2.LINE_AA,
+    )
+    cv2.putText(
+        img, text, org, cv2.FONT_HERSHEY_SIMPLEX, font_scale,
+        color, thickness, cv2.LINE_AA,
+    )
+
+
+def draw_tag_xyz_label(img, marker_corners, tag_id, t_c_tag, used_for_fusion):
+    pts = marker_corners.reshape(-1, 2)
+    anchor = pts.min(axis=0).astype(int)
+    x = int(np.clip(anchor[0], 4, max(4, img.shape[1] - 260)))
+    y = int(np.clip(anchor[1] - 8, 18, max(18, img.shape[0] - 34)))
+    color = (80, 255, 80) if used_for_fusion else (0, 180, 255)
+
+    put_text_with_outline(
+        img,
+        f'id {tag_id}: x {t_c_tag[0]:+.3f} y {t_c_tag[1]:+.3f} z {t_c_tag[2]:+.3f} m',
+        (x, y),
+        0.45,
+        color,
+        1,
+    )
+
+
+def draw_projected_line(img, K, dist, p0, p1, color=(150, 150, 150), thickness=1):
+    pts = np.asarray([p0, p1], dtype=np.float64).reshape(2, 3)
+    imgpts, _ = cv2.projectPoints(pts, np.zeros(3), np.zeros(3), K, dist)
+    imgpts = imgpts.reshape(-1, 2)
+    if not np.isfinite(imgpts).all():
+        return
+    h, w = img.shape[:2]
+    p0_px = tuple(np.clip(imgpts[0], [0, 0], [w - 1, h - 1]).astype(int))
+    p1_px = tuple(np.clip(imgpts[1], [0, 0], [w - 1, h - 1]).astype(int))
+    cv2.line(img, p0_px, p1_px, color, thickness, cv2.LINE_AA)
 
 
 def marker_object_points(marker_size_m):
@@ -303,6 +356,9 @@ class ProbeTracker(Node):
         self.declare_parameter('color_auto_exposure', True)
         self.declare_parameter('color_auto_white_balance', True)
         self.declare_parameter('show_gui', True)
+        self.declare_parameter('show_tag_axes_overlay', True)
+        self.declare_parameter('show_tag_probe_overlay', True)
+        self.declare_parameter('show_tag_xyz_overlay', False)
         self.declare_parameter('n_particles', 3000)
         self.declare_parameter('process_noise', 0.002)
         self.declare_parameter('meas_noise', 0.015)
@@ -359,6 +415,15 @@ class ProbeTracker(Node):
             self.get_parameter('color_auto_white_balance').value
         )
         self.show_gui = self.get_parameter('show_gui').value
+        self.show_tag_axes_overlay = bool(
+            self.get_parameter('show_tag_axes_overlay').value
+        )
+        self.show_tag_probe_overlay = bool(
+            self.get_parameter('show_tag_probe_overlay').value
+        )
+        self.show_tag_xyz_overlay = bool(
+            self.get_parameter('show_tag_xyz_overlay').value
+        )
         n_particles = self.get_parameter('n_particles').value
         proc_noise = self.get_parameter('process_noise').value
         meas_noise = self.get_parameter('meas_noise').value
@@ -790,6 +855,8 @@ class ProbeTracker(Node):
         tag_measurement_weights = []
         fusion_tag_ids = []
         detected_tag_poses = []
+        tag_probe_overlays = []
+        tag_xyz_overlays = []
         primary_tag_visible = False
 
         if ids is not None and len(ids) > 0:
@@ -860,6 +927,13 @@ class ProbeTracker(Node):
                     primary_tag_visible = True
                 detected_tag_poses.append((
                     tag_id, t_c_tag, R_c_tag, used_for_fusion, area_px, reproj_err_px
+                ))
+                if R_c_probe is not None and t_c_probe is not None:
+                    tag_probe_overlays.append((
+                        tag_id, t_c_tag, t_c_probe, R_c_probe, used_for_fusion
+                    ))
+                tag_xyz_overlays.append((
+                    marker_corners, tag_id, t_c_tag, used_for_fusion
                 ))
                 if not used_for_fusion:
                     continue
@@ -1050,6 +1124,46 @@ class ProbeTracker(Node):
                     f'ROT:   [{euler[0]:.1f}, {euler[1]:.1f}, {euler[2]:.1f}]',
                     (12, 70), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2,
                     cv2.LINE_AA)
+
+            if self.show_tag_axes_overlay:
+                for tag_id, t_c_tag, R_c_tag, _, _, _ in detected_tag_poses:
+                    draw_axes(
+                        frame,
+                        self.camera_matrix,
+                        self.dist_coeffs,
+                        R_c_tag,
+                        t_c_tag,
+                        axis_len=self.marker_m * 1.5,
+                        thickness=2,
+                    )
+
+            if self.show_tag_probe_overlay:
+                for tag_id, t_c_tag, t_c_probe, R_c_probe, used_for_fusion in tag_probe_overlays:
+                    color = (180, 180, 180) if used_for_fusion else (80, 80, 80)
+                    draw_projected_line(
+                        frame,
+                        self.camera_matrix,
+                        self.dist_coeffs,
+                        t_c_tag,
+                        t_c_probe,
+                        color=color,
+                        thickness=1,
+                    )
+                    draw_axes(
+                        frame,
+                        self.camera_matrix,
+                        self.dist_coeffs,
+                        R_c_probe,
+                        t_c_probe,
+                        axis_len=0.03,
+                        thickness=1,
+                    )
+
+            if self.show_tag_xyz_overlay:
+                for marker_corners, tag_id, t_c_tag, used_for_fusion in tag_xyz_overlays:
+                    draw_tag_xyz_label(
+                        frame, marker_corners, tag_id, t_c_tag, used_for_fusion
+                    )
 
             n_tags = len(ids) if ids is not None else 0
             cv2.putText(frame, f'Tags: {n_tags}', (12, 25),
