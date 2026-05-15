@@ -241,6 +241,7 @@ class NaturalHandler(Node):
         self.declare_parameter("global_tool_pos_max", [0.64, 0.44, 0.49])
         self.declare_parameter("maxiter", 60)
         self.declare_parameter("look_alignment_weight", 100.0)
+        self.declare_parameter("target_aim_offset_m", [0.0, 0.0, 0.0])
         self.declare_parameter("camera_distance_min_m", 0.25)
         self.declare_parameter("camera_distance_max_m", 0.35)
         self.declare_parameter("camera_distance_weight", 20.0)
@@ -313,6 +314,10 @@ class NaturalHandler(Node):
         self.look_alignment_weight = max(
             0.0,
             float(self.get_parameter("look_alignment_weight").value),
+        )
+        self.target_aim_offset_m = self._get_vector_parameter(
+            "target_aim_offset_m",
+            [0.0, 0.0, 0.0],
         )
         self.camera_distance_min_m = max(
             0.0,
@@ -453,6 +458,7 @@ class NaturalHandler(Node):
             f"bias global side using signed fused +y, "
             f"bias camera +y to projected fused +y; "
             f"look_weight={self.look_alignment_weight:.3f}, "
+            f"aim_offset={np.round(self.target_aim_offset_m, 3).tolist()}, "
             f"distance_band=[{self.camera_distance_min_m:.3f}, "
             f"{self.camera_distance_max_m:.3f}]m, "
             f"distance_weight={self.camera_distance_weight:.3f}, "
@@ -621,6 +627,17 @@ class NaturalHandler(Node):
             return
         self.target_camera_pos = pos.copy()
         self.last_target_camera_update_sec = stamp_sec
+
+    def _aim_position(self, target_pos: np.ndarray, target_quat: np.ndarray) -> np.ndarray:
+        offset = np.asarray(self.target_aim_offset_m, dtype=float)
+        if offset.shape != (3,) or np.linalg.norm(offset) <= 1e-9:
+            return np.asarray(target_pos, dtype=float)
+        try:
+            return np.asarray(target_pos, dtype=float) + ScipyR.from_quat(
+                target_quat
+            ).apply(offset)
+        except Exception:
+            return np.asarray(target_pos, dtype=float)
 
     def _target_near_attached_pose(self) -> bool:
         if not self.disable_near_attached_target:
@@ -1194,6 +1211,7 @@ class NaturalHandler(Node):
             return
 
         target_pos, target_quat, stale_age = target_state
+        aim_pos = self._aim_position(target_pos, target_quat)
         if stale_age > self.hard_stale_sec:
             self._publish_search_pose(curr_pos, curr_rotvec)
             self.get_logger().warn(
@@ -1210,7 +1228,7 @@ class NaturalHandler(Node):
         new_pos, new_quat = self.optimize_pose(
             curr_pos,
             curr_rotvec,
-            target_pos,
+            aim_pos,
             target_quat,
             trans_tool_cam,
         )
