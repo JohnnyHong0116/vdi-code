@@ -291,7 +291,20 @@ def estimate_marker_pose_candidates(marker_corners, obj_pts, K, dist):
     return candidates
 
 
-def detect_markers_with_fallback(gray, dictionary, parameters, use_clahe=False):
+def _scaled_marker_corners(corners, scale):
+    if scale == 1.0 or corners is None:
+        return corners
+    return [np.asarray(c, dtype=np.float32) / float(scale) for c in corners]
+
+
+def detect_markers_with_fallback(
+    gray,
+    dictionary,
+    parameters,
+    use_clahe=False,
+    use_upscale=False,
+    upscale_factor=2.0,
+):
     """Run ArUco detection on the raw image, then optionally on a contrast-
     enhanced image and keep the stronger result.
     """
@@ -310,6 +323,34 @@ def detect_markers_with_fallback(gray, dictionary, parameters, use_clahe=False):
         count2 = 0 if ids2 is None else len(ids2)
         if count2 > best_count:
             best = (corners2, ids2, rejected2)
+            best_count = count2
+
+    if use_upscale and best_count < 2 and upscale_factor > 1.0:
+        scale = float(upscale_factor)
+        up = cv2.resize(
+            gray,
+            None,
+            fx=scale,
+            fy=scale,
+            interpolation=cv2.INTER_CUBIC,
+        )
+        corners3, ids3, rejected3 = cv2.aruco.detectMarkers(
+            up, dictionary, parameters=parameters
+        )
+        count3 = 0 if ids3 is None else len(ids3)
+        if count3 > best_count:
+            best = (_scaled_marker_corners(corners3, scale), ids3, rejected3)
+            best_count = count3
+
+        if use_clahe and best_count < 2:
+            clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+            enhanced_up = clahe.apply(up)
+            corners4, ids4, rejected4 = cv2.aruco.detectMarkers(
+                enhanced_up, dictionary, parameters=parameters
+            )
+            count4 = 0 if ids4 is None else len(ids4)
+            if count4 > best_count:
+                best = (_scaled_marker_corners(corners4, scale), ids4, rejected4)
 
     return best
 
@@ -382,6 +423,8 @@ class ProbeTracker(Node):
         self.declare_parameter('single_tag_max_jump_m', 0.12)
         self.declare_parameter('use_clahe_detection', True)
         self.declare_parameter('use_aruco3_detection', False)
+        self.declare_parameter('use_upscale_detection', True)
+        self.declare_parameter('detection_upscale_factor', 2.0)
         self.declare_parameter('hold_last_pose_s', 0.06)
         self.declare_parameter('min_pos_alpha', 0.28)
         self.declare_parameter('max_pos_alpha', 1.0)
@@ -470,6 +513,13 @@ class ProbeTracker(Node):
         )
         self.use_aruco3_detection = (
             self.get_parameter('use_aruco3_detection').value
+        )
+        self.use_upscale_detection = bool(
+            self.get_parameter('use_upscale_detection').value
+        )
+        self.detection_upscale_factor = max(
+            1.0,
+            float(self.get_parameter('detection_upscale_factor').value),
         )
         self.hold_last_pose_s = self.get_parameter('hold_last_pose_s').value
         self.min_pos_alpha = self.get_parameter('min_pos_alpha').value
@@ -843,7 +893,9 @@ class ProbeTracker(Node):
             gray,
             self.aruco_dict,
             self.aruco_params,
-            use_clahe=(self.use_infrared and self.use_clahe_detection),
+            use_clahe=self.use_clahe_detection,
+            use_upscale=self.use_upscale_detection,
+            upscale_factor=self.detection_upscale_factor,
         )
         detect_ms = (time.perf_counter() - detect_start) * 1000.0
 
