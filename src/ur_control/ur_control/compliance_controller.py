@@ -35,7 +35,9 @@ class ComplianceController(Node):
         self.declare_parameter('teleop_active_topic', '/ur7e/teleop_active')
         self.declare_parameter('mode_topic', '/mode')
         self.declare_parameter('desired_pose_topic', '/ur7e/desired_pose')
-        self.declare_parameter('wrench_topic', '/force_torque_sensor_broadcaster/wrench')
+        self.declare_parameter('wrench_topic', '/ur7e/ft_internal_calibrated')
+        self.declare_parameter('calibration_ready_topic', '/ft_calibration/ready')
+        self.declare_parameter('calibration_required', True)
 
         self.declare_parameter('stiffness_linear', 500.0)      # N/m
         self.declare_parameter('stiffness_angular', 100.0)      # Nm/rad
@@ -50,7 +52,7 @@ class ComplianceController(Node):
         self.declare_parameter('invert_force_sign', False)     # False => yield with force
         self.declare_parameter('invert_torque_sign', True)     # True matches legacy yaw sign
         self.declare_parameter('torque_z_only', True)          # Only yaw compliance
-        self.declare_parameter('tare_samples', 50)
+        self.declare_parameter('tare_samples', 0)
         self.declare_parameter('wait_for_tf', False)
         # Latch target on contact so arm returns to the pre-contact target after force is released
         self.declare_parameter('freeze_target_on_contact', True)
@@ -67,6 +69,10 @@ class ComplianceController(Node):
         self.mode_topic = self.get_parameter('mode_topic').value
         self.output_topic = self.get_parameter('desired_pose_topic').value
         self.wrench_topic = self.get_parameter('wrench_topic').value
+        self.calibration_ready_topic = self.get_parameter('calibration_ready_topic').value
+        self.calibration_required = bool(
+            self.get_parameter('calibration_required').value
+        )
 
         self.K_lin = float(self.get_parameter('stiffness_linear').value)
         self.K_ang = float(self.get_parameter('stiffness_angular').value)
@@ -98,6 +104,7 @@ class ComplianceController(Node):
         self.engaged = False
         self.teleop_active = False
         self.mode = -1
+        self.calibration_ready = not self.calibration_required
 
         self.forces = np.zeros(3, dtype=float)
         self.torques = np.zeros(3, dtype=float)
@@ -112,7 +119,7 @@ class ComplianceController(Node):
         self.bias_samples = []
         self.bias_force = np.zeros(3, dtype=float)
         self.bias_torque = np.zeros(3, dtype=float)
-        self.is_tared = False
+        self.is_tared = (self.tare_samples == 0)
         self.warned_tf = False
         # TF
         self.tf_buffer = tf2_ros.Buffer()
@@ -128,6 +135,7 @@ class ComplianceController(Node):
         # Subs/Pubs
         self.create_subscription(PoseStamped, self.target_topic, self.on_target_pose, 1)
         self.create_subscription(Bool, self.teleop_active_topic, self.on_teleop_active, 1)
+        self.create_subscription(Bool, self.calibration_ready_topic, self.on_calibration_ready, 10)
         self.create_subscription(Int32, self.mode_topic, self.on_mode, 10)
         self.create_subscription(WrenchStamped, self.wrench_topic, self.on_wrench, qos_sensor)
         self.compliant_pub = self.create_publisher(PoseStamped, self.output_topic, 1)
@@ -140,6 +148,10 @@ class ComplianceController(Node):
         self.get_logger().info(f"Teleop active topic: {self.teleop_active_topic}")
         self.get_logger().info(f"Mode topic: {self.mode_topic}")
         self.get_logger().info(f"Wrench: {self.wrench_topic} (tool_frame={self.tool_frame})")
+        self.get_logger().info(
+            f"Calibration gate: required={self.calibration_required}, "
+            f"topic={self.calibration_ready_topic}"
+        )
         self.get_logger().info(f"Disable compliance in mode 2: {self.disable_compliance_in_mode2}")
 
     def _natural_mode_active(self) -> bool:
@@ -184,6 +196,9 @@ class ComplianceController(Node):
 
     def on_teleop_active(self, msg: Bool):
         self.teleop_active = bool(msg.data)
+
+    def on_calibration_ready(self, msg: Bool):
+        self.calibration_ready = bool(msg.data)
 
     def on_mode(self, msg: Int32):
         self.mode = int(msg.data)
@@ -260,6 +275,9 @@ class ComplianceController(Node):
     # ------------------------------------------------------------------ #
     # Control loop
     def tick(self):
+        if self.calibration_required and not self.calibration_ready:
+            return
+
         if self.desired_pos is None or self.desired_q is None:
             return
 

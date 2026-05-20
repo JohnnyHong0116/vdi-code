@@ -241,6 +241,7 @@ class NaturalHandler(Node):
         self.declare_parameter("global_tool_pos_max", [0.64, 0.44, 0.49])
         self.declare_parameter("maxiter", 60)
         self.declare_parameter("look_alignment_weight", 100.0)
+        self.declare_parameter("target_aim_offset_m", [0.0, 0.0, 0.0])
         self.declare_parameter("camera_distance_min_m", 0.25)
         self.declare_parameter("camera_distance_max_m", 0.35)
         self.declare_parameter("camera_distance_weight", 20.0)
@@ -255,11 +256,15 @@ class NaturalHandler(Node):
         self.declare_parameter("rotation_motion_weight", 0.1)
         self.declare_parameter("command_translation_deadband_m", 0.004)
         self.declare_parameter("command_rotation_deadband_rad", 0.035)
+        self.declare_parameter("optimizer_target_deadband_m", 0.035)
+        self.declare_parameter("optimizer_target_alpha", 0.30)
+        self.declare_parameter("optimizer_target_rot_deadband_deg", 15.0)
+        self.declare_parameter("optimizer_target_rot_alpha", 0.30)
         self.declare_parameter("search_yaw_amplitude_rad", 0.35)
         self.declare_parameter("search_yaw_frequency_hz", 0.25)
         self.declare_parameter("search_yaw_axis_sign", 1.0)
-        self.declare_parameter("disable_near_attached_target", True)
-        self.declare_parameter("attached_target_camera_pos", [0.029, -0.025, 0.159])
+        self.declare_parameter("attached_pose_stop_enabled", True)
+        self.declare_parameter("attached_target_camera_pos", [0.0282, -0.0173, 0.1693])
         self.declare_parameter("attached_target_camera_radius_m", 0.04)
 
         self.mode_topic = str(self.get_parameter("mode_topic").value)
@@ -314,6 +319,10 @@ class NaturalHandler(Node):
             0.0,
             float(self.get_parameter("look_alignment_weight").value),
         )
+        self.target_aim_offset_m = self._get_vector_parameter(
+            "target_aim_offset_m",
+            [0.0, 0.0, 0.0],
+        )
         self.camera_distance_min_m = max(
             0.0,
             float(self.get_parameter("camera_distance_min_m").value),
@@ -365,6 +374,24 @@ class NaturalHandler(Node):
             0.0,
             float(self.get_parameter("command_rotation_deadband_rad").value),
         )
+        self.optimizer_target_deadband_m = max(
+            0.0,
+            float(self.get_parameter("optimizer_target_deadband_m").value),
+        )
+        self.optimizer_target_alpha = float(np.clip(
+            float(self.get_parameter("optimizer_target_alpha").value),
+            0.0,
+            1.0,
+        ))
+        self.optimizer_target_rot_deadband_rad = np.deg2rad(max(
+            0.0,
+            float(self.get_parameter("optimizer_target_rot_deadband_deg").value),
+        ))
+        self.optimizer_target_rot_alpha = float(np.clip(
+            float(self.get_parameter("optimizer_target_rot_alpha").value),
+            0.0,
+            1.0,
+        ))
         self.search_yaw_amplitude_rad = max(
             0.0,
             float(self.get_parameter("search_yaw_amplitude_rad").value),
@@ -376,23 +403,16 @@ class NaturalHandler(Node):
         self.search_yaw_axis_sign = 1.0 if float(
             self.get_parameter("search_yaw_axis_sign").value
         ) >= 0.0 else -1.0
-        self.disable_near_attached_target = bool(
-            self.get_parameter("disable_near_attached_target").value
+        self.attached_pose_stop_enabled = bool(
+            self.get_parameter("attached_pose_stop_enabled").value
         )
-        self.attached_target_camera_pos = np.asarray(
-            self.get_parameter("attached_target_camera_pos").value,
-            dtype=float,
-        ).reshape(-1)
-        if self.attached_target_camera_pos.size != 3:
-            self.get_logger().warn(
-                "attached_target_camera_pos must have 3 values; using default"
-            )
-            self.attached_target_camera_pos = np.array(
-                [0.029, -0.025, 0.159],
-                dtype=float,
-            )
-        self.attached_target_camera_radius_m = float(
-            self.get_parameter("attached_target_camera_radius_m").value
+        self.attached_target_camera_pos = self._get_vector_parameter(
+            "attached_target_camera_pos",
+            [0.0282, -0.0173, 0.1693],
+        )
+        self.attached_target_camera_radius_m = max(
+            0.0,
+            float(self.get_parameter("attached_target_camera_radius_m").value),
         )
 
         self.tf_buffer = Buffer()
@@ -410,6 +430,8 @@ class NaturalHandler(Node):
         self.search_center_pos = None
         self.search_center_rotvec = None
         self.search_initial_direction = 1.0
+        self.optimizer_target_pos = None
+        self.optimizer_target_quat = None
 
         self.target_pos = None
         self.target_quat = None
@@ -453,6 +475,7 @@ class NaturalHandler(Node):
             f"bias global side using signed fused +y, "
             f"bias camera +y to projected fused +y; "
             f"look_weight={self.look_alignment_weight:.3f}, "
+            f"aim_offset={np.round(self.target_aim_offset_m, 3).tolist()}, "
             f"distance_band=[{self.camera_distance_min_m:.3f}, "
             f"{self.camera_distance_max_m:.3f}]m, "
             f"distance_weight={self.camera_distance_weight:.3f}, "
@@ -462,6 +485,10 @@ class NaturalHandler(Node):
             f"delta_pos={self.delta_pos_max_m:.3f}m, "
             f"command_deadband={self.command_translation_deadband_m:.3f}m/"
             f"{self.command_rotation_deadband_rad:.3f}rad, "
+            f"optimizer_target_filter={self.optimizer_target_deadband_m:.3f}m/"
+            f"{np.rad2deg(self.optimizer_target_rot_deadband_rad):.1f}deg "
+            f"alpha={self.optimizer_target_alpha:.2f}/"
+            f"{self.optimizer_target_rot_alpha:.2f}, "
             f"search_yaw={self.search_yaw_amplitude_rad:.3f}rad@"
             f"{self.search_yaw_frequency_hz:.2f}Hz, "
             f"internal_radius={self.internal_bound_radius_m:.3f}m, "
@@ -483,7 +510,7 @@ class NaturalHandler(Node):
             f"{np.round(self.global_tool_pos_max, 3).tolist()}"
         )
         self.get_logger().info(
-            f"attached-target guard: enabled={self.disable_near_attached_target}, "
+            f"attached pose stop: enabled={self.attached_pose_stop_enabled}, "
             f"camera_pos={np.round(self.attached_target_camera_pos, 4).tolist()}, "
             f"radius={self.attached_target_camera_radius_m:.3f}m"
         )
@@ -541,6 +568,8 @@ class NaturalHandler(Node):
         self.search_center_pos = None
         self.search_center_rotvec = None
         self.search_initial_direction = 1.0
+        self.optimizer_target_pos = None
+        self.optimizer_target_quat = None
 
     def on_target_visible(self, msg: Bool):
         self.target_visible = bool(msg.data)
@@ -622,11 +651,77 @@ class NaturalHandler(Node):
         self.target_camera_pos = pos.copy()
         self.last_target_camera_update_sec = stamp_sec
 
+    def _aim_position(self, target_pos: np.ndarray, target_quat: np.ndarray) -> np.ndarray:
+        offset = np.asarray(self.target_aim_offset_m, dtype=float)
+        if offset.shape != (3,) or np.linalg.norm(offset) <= 1e-9:
+            return np.asarray(target_pos, dtype=float)
+        try:
+            return np.asarray(target_pos, dtype=float) + ScipyR.from_quat(
+                target_quat
+            ).apply(offset)
+        except Exception:
+            return np.asarray(target_pos, dtype=float)
+
+    def _filtered_optimizer_target(
+        self,
+        target_pos: np.ndarray,
+        target_quat: np.ndarray,
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        target_pos = np.asarray(target_pos, dtype=float)
+        target_quat = np.asarray(target_quat, dtype=float)
+
+        if self.optimizer_target_pos is None or self.optimizer_target_quat is None:
+            self.optimizer_target_pos = target_pos.copy()
+            self.optimizer_target_quat = target_quat.copy()
+            return target_pos.copy(), target_quat.copy()
+
+        filtered_pos = self.optimizer_target_pos.copy()
+        pos_delta = target_pos - filtered_pos
+        pos_step = float(np.linalg.norm(pos_delta))
+        if pos_step >= self.optimizer_target_deadband_m:
+            alpha = self.optimizer_target_alpha
+            if self.optimizer_target_deadband_m > 1e-9:
+                ramp = (pos_step - self.optimizer_target_deadband_m) / (
+                    4.0 * self.optimizer_target_deadband_m
+                )
+                alpha = float(np.clip(
+                    alpha + (1.0 - alpha) * ramp,
+                    alpha,
+                    1.0,
+                ))
+            filtered_pos = filtered_pos + alpha * pos_delta
+
+        prev_rot = ScipyR.from_quat(self.optimizer_target_quat)
+        target_rot = ScipyR.from_quat(target_quat)
+        rot_delta = target_rot * prev_rot.inv()
+        rotvec_delta = rot_delta.as_rotvec()
+        rot_step = float(np.linalg.norm(rotvec_delta))
+        filtered_quat = self.optimizer_target_quat.copy()
+        if rot_step >= self.optimizer_target_rot_deadband_rad:
+            alpha = self.optimizer_target_rot_alpha
+            if self.optimizer_target_rot_deadband_rad > 1e-9:
+                ramp = (rot_step - self.optimizer_target_rot_deadband_rad) / (
+                    4.0 * self.optimizer_target_rot_deadband_rad
+                )
+                alpha = float(np.clip(
+                    alpha + (1.0 - alpha) * ramp,
+                    alpha,
+                    1.0,
+                ))
+            filtered_quat = (
+                ScipyR.from_rotvec(alpha * rotvec_delta)
+                * prev_rot
+            ).as_quat()
+
+        self.optimizer_target_pos = filtered_pos.copy()
+        self.optimizer_target_quat = filtered_quat.copy()
+        return filtered_pos, filtered_quat
+
     def _target_near_attached_pose(self) -> bool:
-        if not self.disable_near_attached_target:
-            return False
         if (
-            self.target_camera_pos is None
+            not self.attached_pose_stop_enabled
+            or self.attached_target_camera_radius_m <= 1e-9
+            or self.target_camera_pos is None
             or self.last_target_camera_update_sec is None
         ):
             return False
@@ -638,14 +733,15 @@ class NaturalHandler(Node):
         dist = float(np.linalg.norm(
             self.target_camera_pos - self.attached_target_camera_pos
         ))
-        near_attached = dist <= self.attached_target_camera_radius_m
-        if near_attached:
-            self.get_logger().info(
-                f"fused target near attached pose; holding natural command "
-                f"({dist:.3f}m <= {self.attached_target_camera_radius_m:.3f}m)",
-                throttle_duration_sec=1.0,
-            )
-        return near_attached
+        if dist > self.attached_target_camera_radius_m:
+            return False
+
+        self.get_logger().info(
+            f"fused target near attached pose; holding natural command "
+            f"({dist:.3f}m <= {self.attached_target_camera_radius_m:.3f}m)",
+            throttle_duration_sec=1.0,
+        )
+        return True
 
     def _transform_pose_to_base(
         self,
@@ -1183,24 +1279,39 @@ class NaturalHandler(Node):
             return
         curr_pos, curr_rotvec, trans_tool_cam = tool_state
 
-        target_state = self._get_active_target_pose()
-        if target_state is None or not self._target_visible_active():
-            self._publish_search_pose(curr_pos, curr_rotvec)
-            return
-
         if self._target_near_attached_pose():
             self._publish_target_lost(False)
+            self.optimizer_target_pos = None
+            self.optimizer_target_quat = None
+            self.search_start_sec = None
+            self.search_center_pos = None
+            self.search_center_rotvec = None
             self._publish_hold_pose(curr_pos, curr_rotvec)
+            return
+
+        target_state = self._get_active_target_pose()
+        if target_state is None or not self._target_visible_active():
+            self.optimizer_target_pos = None
+            self.optimizer_target_quat = None
+            self._publish_search_pose(curr_pos, curr_rotvec)
             return
 
         target_pos, target_quat, stale_age = target_state
         if stale_age > self.hard_stale_sec:
+            self.optimizer_target_pos = None
+            self.optimizer_target_quat = None
             self._publish_search_pose(curr_pos, curr_rotvec)
             self.get_logger().warn(
                 f"target stale for {stale_age:.2f}s; skipping command",
                 throttle_duration_sec=1.0,
             )
             return
+
+        stable_target_pos, stable_target_quat = self._filtered_optimizer_target(
+            target_pos,
+            target_quat,
+        )
+        aim_pos = self._aim_position(stable_target_pos, stable_target_quat)
 
         self._publish_target_lost(False)
         self.search_start_sec = None
@@ -1210,8 +1321,8 @@ class NaturalHandler(Node):
         new_pos, new_quat = self.optimize_pose(
             curr_pos,
             curr_rotvec,
-            target_pos,
-            target_quat,
+            aim_pos,
+            stable_target_quat,
             trans_tool_cam,
         )
         if self._command_change_exceeds_deadband(curr_pos, curr_rotvec, new_pos, new_quat):

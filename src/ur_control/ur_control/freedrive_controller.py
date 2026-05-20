@@ -14,7 +14,7 @@ class FreedriveController(Node):
         self.declare_parameter('freedrive_mode_value', 2)
         self.declare_parameter('check_rate_hz', 50.0)
         self.declare_parameter('activation_delay_s', 0.20)
-        self.declare_parameter('publish_end_on_exit', True)
+        self.declare_parameter('publish_end_on_exit', False)
 
         self.mode_topic = str(self.get_parameter('mode_topic').value)
         self.script_topic = str(self.get_parameter('script_topic').value)

@@ -32,6 +32,8 @@ class ModeHandler(Node):
     def __init__(self):
         super().__init__('mode_handler')
         self.declare_parameter('spacemouse_input_topic', '/ur7e/teleop_active')
+        self.declare_parameter('calibration_ready_topic', '/ft_calibration/ready')
+        self.declare_parameter('calibration_required', True)
         self.declare_parameter(
             'natural_optimizing_topic',
             '/natural_handler/optimizing_active',
@@ -42,7 +44,7 @@ class ModeHandler(Node):
         )
         self.declare_parameter('natural_optimizing_timeout_s', 0.6)
         self.declare_parameter('external_force_topic', '/uniforce/force')
-        self.declare_parameter('wrench_topic', '/force_torque_sensor_broadcaster/wrench')
+        self.declare_parameter('wrench_topic', '/ur7e/ft_internal_calibrated')
         self.declare_parameter('env_wrench_topic', '/ur7e/ft_env_sensor')
         self.declare_parameter('tool_frame', 'tool0')
         self.declare_parameter('force_discrepancy_axis_sign', -1.0)
@@ -54,9 +56,13 @@ class ModeHandler(Node):
         self.declare_parameter('kinesthetic_request_hold_s', 2.0)
         self.declare_parameter('tool_contact_debounce_s', 0.5)
         self.declare_parameter('external_force_default', 0.0)
-        self.declare_parameter('wrench_tare_samples', 50)
+        self.declare_parameter('wrench_tare_samples', 0)
         self.declare_parameter('enable_freedrive_controller_topic', False)
         self.spacemouse_input_topic = self.get_parameter('spacemouse_input_topic').value
+        self.calibration_ready_topic = self.get_parameter('calibration_ready_topic').value
+        self.calibration_required = bool(
+            self.get_parameter('calibration_required').value
+        )
         self.natural_optimizing_topic = self.get_parameter(
             'natural_optimizing_topic'
         ).value
@@ -127,6 +133,7 @@ class ModeHandler(Node):
         self.wrench_is_tared = (self.wrench_tare_samples == 0)
         self.kinesthetic_request_start = None
         self.kinesthetic_entry_armed_after_hold = False
+        self.calibration_ready = not self.calibration_required
         self.natural_optimizing = False
         self.last_natural_optimizing_sec = None
         self.natural_target_lost = False
@@ -142,6 +149,8 @@ class ModeHandler(Node):
             Int32, '/tool_contact', self.store_tool_contact, 10)
         self.sm_sub = self.create_subscription(
             Bool, self.spacemouse_input_topic, self.store_curr_sm, 10)
+        self.calibration_ready_sub = self.create_subscription(
+            Bool, self.calibration_ready_topic, self.store_calibration_ready, 10)
         self.natural_optimizing_sub = self.create_subscription(
             Bool,
             self.natural_optimizing_topic,
@@ -179,6 +188,10 @@ class ModeHandler(Node):
         }
 
         self.get_logger().info('ModeHandler initialized, waiting for startup...')
+        self.get_logger().info(
+            f'Calibration gate: required={self.calibration_required}, '
+            f'topic={self.calibration_ready_topic}'
+        )
         self.get_logger().info(f'SpaceMouse input topic: {self.spacemouse_input_topic}')
         self.get_logger().info(
             f'Natural optimizing topic: {self.natural_optimizing_topic}'
@@ -215,6 +228,12 @@ class ModeHandler(Node):
 
     def store_curr_sm(self, msg):
         self.curr_sm = msg.data
+
+    def store_calibration_ready(self, msg):
+        was_ready = self.calibration_ready
+        self.calibration_ready = bool(msg.data)
+        if self.calibration_ready and not was_ready:
+            self.get_logger().info('FT calibration ready; enabling mode logic.')
 
     def store_natural_optimizing(self, msg):
         self.natural_optimizing = bool(msg.data)
@@ -288,6 +307,11 @@ class ModeHandler(Node):
 
     def handle_mode_cmd(self, msg):
         """Handle direct mode command - request mode change via tick loop"""
+        if self.calibration_required and not self.calibration_ready:
+            self.get_logger().warn(
+                'Ignoring mode command until FT calibration is ready.'
+            )
+            return
         cmd_mode = msg.data
         if cmd_mode in [MODE_IDLE, MODE_TELEOP, MODE_KINESTHETIC, MODE_NATURAL]:
             self.target_mode = cmd_mode
@@ -420,6 +444,18 @@ class ModeHandler(Node):
 
     def mode_processor(self):
         """Main mode processing loop."""
+        if self.calibration_required and not self.calibration_ready:
+            if self.mode != MODE_INIT:
+                self.mode = MODE_INIT
+                self.get_logger().info('Mode changed to: calibration/init')
+            self.led_pub.publish(String(data='a'))
+            if self.enable_freedrive_controller_topic:
+                self.freedrive_pub.publish(Bool(data=False))
+            mode_msg = Int32()
+            mode_msg.data = MODE_INIT
+            self.mode_pub.publish(mode_msg)
+            return
+
         if self.target_mode is not None:
             new_mode = self.target_mode
             self.target_mode = None
